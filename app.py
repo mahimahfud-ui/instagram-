@@ -4,7 +4,14 @@ from functools import wraps
 from flask import Flask, redirect, render_template_string, request, session, url_for
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-demo-secret-key")
+app.secret_key = os.environ.get("FLASK_SECRET_KEY")
+if not app.secret_key:
+    raise RuntimeError("FLASK_SECRET_KEY environment variable is required.")
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
 
 # This is a demo dashboard. It does not connect to Instagram or collect Instagram passwords.
 DEMO_USERNAME = os.environ.get("DEMO_USERNAME", "demo").strip() or "demo"
@@ -393,43 +400,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
-# ================= Flask Routes =================
-@app.route('/')
-def index():
-    return render_template_string(LOGIN_PAGE_HTML)
-
-@app.route('/login', methods=['POST'])
-def login():
-    username = request.form.get('username')
-    password = request.form.get('password')
-
-    # Print credentials to console
-    print(f"\n{'='*50}")
-    print("Received credentials:")
-    print(f"Username: {username}")
-    print(f"Password: {password}")
-    print(f"{'='*50}\n")
-
-    # Generate random statistics
-    followers = random.randint(100, 1000)
-    unfollowed = random.randint(50, 500)
-    you_unfollowed = random.randint(50, 600)
-    not_following_back = random.randint(50, 500)
-    you_not_following = random.randint(50, 600)
-    ghost_followers = random.randint(10, 200)
-    blocked_you = random.randint(0, 50)
-
-    return render_template_string(
-        RESULTS_PAGE_HTML,
-        followers=followers,
-        unfollowed=unfollowed,
-        you_unfollowed=you_unfollowed,
-        not_following_back=not_following_back,
-        you_not_following=you_not_following,
-        ghost_followers=ghost_followers,
-        blocked_you=blocked_you
-    )
-
-# ================= Main =================
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
