@@ -1,0 +1,5 @@
+{% extends "base.html" %}
+ {% block title %}{{ code|default(404) }} · Unavailable{% endblock %}
+ {% block content %}
+
+ <div class="center">    <div class="code">{{ code|default(404) }}</div>    <h1 class="ttl">{{ heading|default('This page isn’t available') }}</h1>    <p class="sub">{{ message|default('The page you’re looking for could not be found or is temporarily unavailable.') }}</p>    <div class="actions" style="justify-content:center">     <a class="btn" href="{{ url_for('overview') }}">Go to overview</a>     <a class="btn g" href="javascript:history.back()">Go back</a>    </div>   </div>   {% endblock %}

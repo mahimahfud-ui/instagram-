@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+ {% block title %}Confirm action{% endblock %}
+ {% block content %}
+ {% set act = request.args.get('action', '') %}
+ {% set uname = request.args.get('username', '') %}
+ {% set back = request.args.get('back', '') %}
+ {% set valid = act in ['unfollow', 'remove', 'follow_back'] %}
+ {% set safe_back = back if back.startswith('/') and not back.startswith('//') else url_for('overview') %}
+ <a class="crumb" href="{{ safe_back }}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>Back</a>
+ {% if not valid or not uname %}
+
+ <div class="center">    <div class="ttl">Invalid request</div>    <p class="sub">This action can’t be confirmed. Go back and try again.</p>    <a class="btn g" href="{{ url_for('overview') }}">Return to overview</a>   </div>   {% else %}   <h1 class="ttl">    {% if act == 'unfollow' %}Unfollow {{ uname }}?    {% elif act == 'remove' %}Remove {{ uname }}?    {% else %}Follow {{ uname }}?{% endif %}   </h1>   <p class="sub">    {% if act == 'unfollow' %}You will stop following this account. You can follow them again later.    {% elif act == 'remove' %}This removes the account from your ghost follower list in Insight. It does not block the account on Instagram.    {% else %}You will send a follow request to this account.{% endif %}   </p>   <form method="post" action="{{ url_for('perform_action') }}" data-once>
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">    <input type="hidden" name="action" value="{{ act }}">    <input type="hidden" name="username" value="{{ uname }}">    <input type="hidden" name="next" value="{{ safe_back }}">    <div class="actions">     <button type="submit" class="btn {{ 'r' if act in ['unfollow', 'remove'] }}">      {% if act == 'unfollow' %}Yes, unfollow{% elif act == 'remove' %}Yes, remove{% else %}Yes, follow{% endif %}     </button>     <a class="btn g" href="{{ safe_back }}">Cancel</a>    </div>   </form>   {% endif %}   {% endblock %}

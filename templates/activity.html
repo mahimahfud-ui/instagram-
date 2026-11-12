@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+ {% import "_icons.html" as ic %}
+ {% block title %}Activity{% endblock %}
+ {% block content %}
+
+ <h1 class="ttl">Activity</h1>   <p class="sub">Likes removed, comments deleted, unfollows and more.</p> <div class="bar">    {% for key, label in [('all','All'),('likes','Removed likes'),('comments','Deleted comments'),('unfollows','Unfollows'),('follows','New followers')] %}    <a class="chip {{ 'on' if category == key }}" href="{{ url_for('activity', category=key, range=range) }}">{{ label }}</a>    {% endfor %}   </div>   <div class="bar">    {% for key, label in [('today','Today'),('yesterday','Yesterday'),('week','This week'),('all','All time')] %}    <a class="chip {{ 'on' if range == key }}" href="{{ url_for('activity', category=category, range=key) }}">{{ label }}</a>    {% endfor %}   </div>   <p class="count">{{ events|length }} {{ 'event' if events|length == 1 else 'events' }}</p> 
+
+{% for group, items in events|groupby('group') %}
+
+ <div class="day">{{ group }}</div>   {% for e in items %}   <a class="row" href="{{ url_for('account_details', username=e.actor, source='activity') }}">    <div class="ic">{{ ic.icon(e.icon) }}</div>    <div class="info">     <b class="plain">{{ e.actor }} {{ e.text }}</b>     <small>{{ e.when }} · <span class="tag {{ e.tag_class }}">{{ e.tag }}</span></small>    </div>   </a>   {% endfor %}   {% else %}   <div class="empty">No activity matches these filters.</div>   {% endfor %}   {% endblock %}

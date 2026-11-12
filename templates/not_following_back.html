@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+ {% import "_icons.html" as ic %}
+ {% block title %}Not Following Back{% endblock %}
+ {% block content %}
+
+ <h1 class="ttl">Not following back</h1>   <p class="sub">Accounts you follow that don’t follow you.</p> <form method="get" action="{{ url_for('not_following_back') }}" role="search" class="bar">    <input class="search" type="search" name="q" value="{{ q }}" placeholder="Search" aria-label="Search accounts">    <input type="hidden" name="f" value="{{ f }}">    <button class="btn g" type="submit">Search</button>   </form>   <div class="bar">    <a class="chip {{ 'on' if f == 'all' }}" href="{{ url_for('not_following_back', q=q, f='all') }}">All</a>    <a class="chip {{ 'on' if f == 'verified' }}" href="{{ url_for('not_following_back', q=q, f='verified') }}">Verified</a>   </div>   <p class="count">{{ accounts|length }} {{ 'account' if accounts|length == 1 else 'accounts' }}</p> 
+
+{% for a in accounts %}
+
+ <div class="row">    <a class="ring s g{{ loop.index0 % 6 }}" href="{{ url_for('account_details', username=a.username, source='notback') }}" aria-label="Open {{ a.username }}"><span>{{ a.initials }}</span></a>    <div class="info">     <b><a href="{{ url_for('account_details', username=a.username, source='notback') }}">{{ a.username }}</a>{% if a.verified %}{{ ic.icon('user') }}{% endif %}</b>     <small>{{ a.name }} · {{ a.meta }}</small>    </div>    <a class="btn g" href="{{ url_for('confirm_action', action='unfollow', username=a.username, back=request.full_path) }}">Following</a>   </div>   {% else %}   <div class="empty">{% if q %}No accounts match “{{ q }}”.{% else %}You’re all caught up ✨{% endif %}</div>   {% endfor %} 
+
+{% if fans %}
+
+ <div class="sec"><h3>Following you · you don’t follow</h3></div>   {% for a in fans %}   <div class="row">    <a class="ring s g{{ loop.index0 % 6 }}" href="{{ url_for('account_details', username=a.username, source='fans') }}" aria-label="Open {{ a.username }}"><span>{{ a.initials }}</span></a>    <div class="info"><b><a href="{{ url_for('account_details', username=a.username, source='fans') }}">{{ a.username }}</a></b><small>{{ a.name }} · {{ a.meta }}</small></div>    <a class="btn" href="{{ url_for('confirm_action', action='follow_back', username=a.username, back=request.full_path) }}">Follow back</a>   </div>   {% endfor %}   {% endif %}   {% endblock %}

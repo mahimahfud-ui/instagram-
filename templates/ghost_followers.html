@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+ {% block title %}Ghost Followers{% endblock %}
+ {% block content %}
+
+ <h1 class="ttl">Ghost followers</h1>   <p class="sub">They follow you but never like, comment or view.</p> <form method="get" action="{{ url_for('ghost_followers') }}" role="search" class="bar">    <input class="search" type="search" name="q" value="{{ q }}" placeholder="Search" aria-label="Search ghost followers">    <input type="hidden" name="f" value="{{ f }}">    <button class="btn g" type="submit">Search</button>   </form>   <div class="bar">    <a class="chip {{ 'on' if f == 'all' }}" href="{{ url_for('ghost_followers', q=q, f='all') }}">All</a>    <a class="chip {{ 'on' if f == 'old' }}" href="{{ url_for('ghost_followers', q=q, f='old') }}">120d+</a>   </div>   <p class="count">{{ accounts|length }} {{ 'account' if accounts|length == 1 else 'accounts' }}</p> 
+
+{% for a in accounts %}
+
+ <div class="row">    <a class="ring s off" href="{{ url_for('account_details', username=a.username, source='ghosts') }}" aria-label="Open {{ a.username }}"><span class="gp">{{ a.initials }}</span></a>    <div class="info">     <b><a href="{{ url_for('account_details', username=a.username, source='ghosts') }}">{{ a.username }}</a><span class="tag red">{{ a.days_inactive }}d</span></b>     <small>{{ a.name }} · {{ a.reason }}</small>    </div>    <a class="btn r" href="{{ url_for('confirm_action', action='remove', username=a.username, back=request.full_path) }}">Remove</a>   </div>   {% else %}   <div class="empty">{% if q %}No accounts match “{{ q }}”.{% else %}No ghost followers found.{% endif %}</div>   {% endfor %}   {% endblock %}
