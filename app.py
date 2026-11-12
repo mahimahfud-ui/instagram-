@@ -29,7 +29,7 @@ LOGIN_PAGE_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Insight — Demo access</title>
+<title>Insight — Sign in</title>
 <style>
 *{box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
 body{margin:0;min-height:100vh;display:flex;justify-content:center;background:#fff;color:#262626}
@@ -50,22 +50,22 @@ input{width:100%;padding:14px 12px;font-size:14px;border:1px solid #dbdbdb;borde
 <main class="content">
 <div class="language">English (US)</div>
 <div class="logo"><img src="https://upload.wikimedia.org/wikipedia/commons/2/21/Instagram_Glyph_Gradient_RGB_logo.svg" alt="Gradient camera icon"></div>
-<p class="note">Private Insight demo. Use the demo username only. This application does not request or store your Instagram password and is not affiliated with Meta.</p>
+<p class="note">Sign in to Insight with the username configured for this service. Do not enter your Instagram password. This independent application is not affiliated with Meta.</p>
 <form method="post" action="{{ url_for('login') }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<input name="username" type="text" placeholder="Demo username (default: demo)" autocomplete="username" maxlength="80" required>
+<input name="username" type="text" placeholder="Username" autocomplete="username" maxlength="80" required>
 <button type="submit" class="login-btn">Continue</button>
 {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
 </form>
 </main>
-<footer class="foot"><div class="meta">∞ Meta</div>Independent demo interface · Not affiliated with or endorsed by Meta</footer>
+<footer class="foot"><div class="meta">∞ Meta</div>Independent analytics interface · Not affiliated with or endorsed by Meta</footer>
 </div>
 </body>
 </html>"""
 
 PROFILE_DEFAULT = {
     "handle": "your.handle", "name": "Your Name", "initials": "YO",
-    "bio": "Creator · Demo profile", "website": "", "posts": "248",
+    "bio": "Creator · Insights dashboard", "website": "", "posts": "248",
     "followers": "12.4K", "following": "842",
 }
 SETTINGS_DEFAULT = {
@@ -149,7 +149,7 @@ def all_accounts():
         ("ghosts", get_ghosts()), ("visitors", get_visitors()),
     ):
         for item in items:
-            item.update(source=source, is_demo=True, color_index=len(rows) % 6)
+            item.update(source=source, is_sample=True, color_index=len(rows) % 6)
             rows.append(item)
     return rows
 
@@ -166,7 +166,7 @@ def find_account(username, source=None):
                     "initials": "".join(p[:1].upper() for p in username.split(".")),
                     "meta": "Illustrative activity entry", "verified": False,
                     "days_inactive": None, "visits": None, "follows_you": False,
-                    "is_following": False, "source": "activity", "is_demo": True,
+                    "is_following": False, "source": "activity", "is_sample": True,
                     "color_index": 0,
                 }
     return None
@@ -182,7 +182,7 @@ def safe_local_path(value):
 def login_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if not session.get("demo_authenticated"):
+        if not session.get("authenticated"):
             return redirect(url_for("index"))
         return view(*args, **kwargs)
     return wrapped
@@ -212,7 +212,7 @@ def shared_context():
 
 @app.get("/")
 def index():
-    if session.get("demo_authenticated"):
+    if session.get("authenticated"):
         return redirect(url_for("overview"))
     return render_template_string(LOGIN_PAGE_HTML, error=None, csrf_token=session.get("_csrf_token", ""))
 
@@ -222,19 +222,19 @@ def login():
         return redirect(url_for("index"))
     username = request.form.get("username", "").strip()
     if not username or len(username) > 80:
-        return render_template_string(LOGIN_PAGE_HTML, error="Enter a valid demo username.", csrf_token=session.get("_csrf_token", "")), 400
+        return render_template_string(LOGIN_PAGE_HTML, error="Enter your username.", csrf_token=session.get("_csrf_token", "")), 400
     if not hmac.compare_digest(username.casefold(), DEMO_USERNAME.casefold()):
-        return render_template_string(LOGIN_PAGE_HTML, error=f"Demo access is limited to username: {DEMO_USERNAME}", csrf_token=session.get("_csrf_token", "")), 401
+        return render_template_string(LOGIN_PAGE_HTML, error="Invalid username. Check the username configured for this service.", csrf_token=session.get("_csrf_token", "")), 401
     session.clear()
     session["_csrf_token"] = secrets.token_urlsafe(32)
-    session["demo_authenticated"] = True
+    session["authenticated"] = True
     session["username"] = username
     session.permanent = True
     return redirect(url_for("overview"))
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": "Insight multi-page demo", "instagram_connected": False}, 200
+    return {"status": "ok", "app": "Insight analytics", "instagram_connected": False}, 200
 
 @app.get("/overview")
 @login_required
@@ -244,7 +244,7 @@ def overview():
         "not_following_back": len(get_not_back()),
         "ghost_followers": len(get_ghosts()),
         "regular_visitors": sum(1 for x in visitors if x["visits"] >= 5),
-        "visitors_change": "Sample activity · demo only",
+        "visitors_change": "Sample activity",
         "removed_likes": 7, "deleted_comments": 4, "unfollows": 3,
         "active_pct": 62, "passive_pct": 24, "ghost_pct": 14,
     }
@@ -362,7 +362,7 @@ def update_settings():
         "privacy_hide_activity": "privacy_hide_activity" in request.form,
         "sync_frequency": frequency,
     }
-    flash("Settings saved for this demo session.", "success")
+    flash("Settings saved.", "success")
     return redirect(url_for("settings"))
 
 @app.get("/profile")
@@ -396,7 +396,7 @@ def update_profile():
     initials = "".join(part[:1].upper() for part in form["name"].split()[:2]) or "YO"
     current["initials"] = initials
     session["profile"] = current
-    flash("Profile updated in this demo session.", "success")
+    flash("Profile updated.", "success")
     return redirect(url_for("profile"))
 
 @app.get("/account/<username>")
@@ -421,7 +421,7 @@ def confirm_action():
     if not account:
         abort(404)
     if action == "unfollow" and not account.get("is_following"):
-        flash("This demo account is not currently followed.", "error")
+        flash("This account is not currently followed.", "error")
         return redirect(safe_local_path(request.args.get("back")))
     if action == "remove" and account.get("source") != "ghosts":
         abort(400)
@@ -444,28 +444,28 @@ def perform_action():
         values = set(session.get("unfollowed_users", []))
         values.add(username)
         session["unfollowed_users"] = sorted(values)
-        flash(f"@{username} removed from the demo following list.", "success")
+        flash(f"@{username} removed from following list.", "success")
     elif action == "follow_back":
         if account.get("source") not in {"fans", "visitors"}:
             abort(400)
         values = set(session.get("followed_users", []))
         values.add(username)
         session["followed_users"] = sorted(values)
-        flash(f"@{username} added to the demo following list.", "success")
+        flash(f"@{username} added to following list.", "success")
     else:
         if account.get("source") != "ghosts":
             abort(400)
         values = set(session.get("removed_ghosts", []))
         values.add(username)
         session["removed_ghosts"] = sorted(values)
-        flash(f"@{username} removed from the demo ghost-follower list.", "success")
+        flash(f"@{username} removed from the ghost-follower list.", "success")
     return redirect(next_url)
 
 @app.post("/logout")
 @login_required
 def logout():
     session.clear()
-    flash("You have logged out of the demo.", "success")
+    flash("You have logged out.", "success")
     return redirect(url_for("index"))
 
 @app.errorhandler(400)
@@ -479,7 +479,7 @@ def bad_request(error):
 def not_found(error):
     return render_template(
         "error.html", code=404, heading="This page isn’t available",
-        message="The requested demo page or account could not be found.",
+        message="The requested page or account could not be found.",
     ), 404
 
 if __name__ == "__main__":
