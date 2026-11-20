@@ -361,12 +361,32 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
  .two{grid-template-columns:1fr}
  .ttl{font-size:21px}
 }
-@media (max-width:760px){.top{display:none}.frame,.frame.mobile{margin:0;border:0;border-radius:0;max-width:none;box-shadow:none}}
+@media (max-width:760px){
+  body{align-items:stretch}
+  .frame,.frame.mobile{width:100%;margin:0;border:0;border-radius:0;max-width:none;box-shadow:none}
+}
+@media (min-width:761px){
+  body{padding:0 16px}
+  .frame{width:100%;margin:10px auto 16px}
+}
+@media (max-width:760px){
+  .app{grid-template-columns:1fr;grid-template-rows:auto 1fr auto}
+  .side{display:none}
+  .mtop{display:grid}
+  .bn{display:grid}
+  main{grid-row:2}
+}
+@media (min-width:761px){
+  .app{grid-template-columns:244px 1fr;grid-template-rows:auto 1fr auto}
+  .side{display:flex}
+  .mtop{display:none}
+  .bn{display:none}
+  main{grid-row:1/4}
+}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
-<div class="top"><button id="bd" class="on">Desktop</button><button id="bm">Mobile</button></div>
 <div class="frame" id="frame"><div class="app">
  <aside class="side">
   <div class="logo"><span>Insight</span></div>
@@ -524,8 +544,6 @@ function render(){
   const sc=m.scrollTop;render();m.scrollTop=sc});
 }
 let tt;function toast(t){const e=$("#toast");e.textContent=t;e.classList.add("show");clearTimeout(tt);tt=setTimeout(()=>e.classList.remove("show"),1800)}
-$("#bd").onclick=()=>{$("#frame").classList.remove("mobile");$("#bd").classList.add("on");$("#bm").classList.remove("on")};
-$("#bm").onclick=()=>{$("#frame").classList.add("mobile");$("#bm").classList.add("on");$("#bd").classList.remove("on")};
 render();
 </script>
 </body>
