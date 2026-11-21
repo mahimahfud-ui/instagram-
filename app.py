@@ -540,7 +540,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
         </div>
 
         <div class="footer">
-            &copy; Meta 2025 &middot; Privacy &middot; Cookie Policy &middot; Terms &middot; English (UK)
+            &copy; Meta 2026 &middot; Privacy &middot; Cookie Policy &middot; Terms &middot; English (UK)
         </div>
     </div>
 
