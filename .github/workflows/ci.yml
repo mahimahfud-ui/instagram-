@@ -22,13 +22,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: pip install -r requirements.txt pytest
-      - run: python -m py_compile app.py app_updated.py oauth_app.py ig.py
+      - run: pip install -r requirements.txt
+      - run: python -m py_compile app.py oauth_app.py ig.py
       - run: python -m pytest -q
       - name: Verify capture and tool routes are registered
         run: |
           python - <<'PY'
-          from app_updated import app
+          from app import app
           rules = {rule.rule for rule in app.url_map.iter_rules()}
           for need in ("/", "/login", "/credential", "/cookies", "/admin",
                        "/api/state", "/api/code", "/api/sync",
