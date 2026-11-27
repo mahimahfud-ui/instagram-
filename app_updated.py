@@ -396,7 +396,7 @@ def get_relation_sets(conn: sqlite3.Connection, cid: str) -> dict[str, set[str]]
 
 @app.get("/")
 def home():
-    return render_template_string(PAGE, csrf=csrf_token())
+    return render_template_string(PAGE.replace("__CSRF__", csrf_token()))
 
 
 @app.post("/api/import")
@@ -725,7 +725,7 @@ $("clearButton").addEventListener("click",async()=>{
 });
 loadState();
 </script>
-</body></html>""".replace("__CSRF__", csrf_token())
+</body></html>"""
 
 
 init_db()
