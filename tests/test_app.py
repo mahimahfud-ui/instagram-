@@ -2,7 +2,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import oauth_app
@@ -16,11 +16,11 @@ class OAuthAppTests(unittest.TestCase):
         oauth_app.app.config.update(TESTING=True, SECRET_KEY="test-secret-that-is-long-enough-123456")
         oauth_app.app.secret_key = "test-secret-that-is-long-enough-123456"
         os.environ["SECRET_KEY"] = "test-secret-that-is-long-enough-123456"
-        os.environ["META_APP_ID"] = "test-meta-app-id"
-        os.environ["META_APP_SECRET"] = "test-meta-app-secret"
-        os.environ["META_LOGIN_CONFIG_ID"] = "test-config-123"
-        os.environ["META_REDIRECT_URI"] = "https://insight.example/oauth/callback"
+        os.environ["INSTAGRAM_APP_ID"] = "test-instagram-app-id"
+        os.environ["INSTAGRAM_APP_SECRET"] = "test-instagram-app-secret"
+        os.environ["INSTAGRAM_REDIRECT_URI"] = "https://insight.example/oauth/callback"
         os.environ.pop("TOKEN_ENCRYPTION_KEY", None)
+        os.environ.pop("INSTAGRAM_SCOPES", None)
         oauth_app.init_db()
         self.client = oauth_app.app.test_client()
 
@@ -33,49 +33,53 @@ class OAuthAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Continue with Instagram", body)
         self.assertIn("password", body.lower())
-        self.assertNotIn('type="file"', body)
+        self.assertNotIn("type=\"file\"", body)
         self.assertNotIn("Import Instagram data", body)
 
-    def test_connect_redirects_to_meta_unified_login(self):
+    def test_connect_redirects_to_instagram_with_state_and_scope(self):
         response = self.client.get("/connect/instagram")
         self.assertEqual(response.status_code, 302)
         parsed = urlparse(response.headers["Location"])
-        self.assertEqual(parsed.netloc, "www.facebook.com")
-        self.assertEqual(parsed.path, "/dialog/oauth")
+        self.assertEqual(parsed.netloc, "www.instagram.com")
         params = parse_qs(parsed.query)
-        self.assertEqual(params["client_id"], ["test-meta-app-id"])
-        self.assertEqual(params["config_id"], ["test-config-123"])
+        self.assertEqual(params["client_id"], ["test-instagram-app-id"])
         self.assertEqual(params["redirect_uri"], ["https://insight.example/oauth/callback"])
-        self.assertEqual(params["response_type"], ["code"])
-        self.assertNotIn("scope", params)
         self.assertTrue(params.get("state", [""])[0])
+        self.assertIn("instagram_business_basic", params["scope"][0])
+
+    def test_oauth_token_exchange_uses_urlencoded_form(self):
+        seen = {}
+        original = oauth_app.urlopen
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+            def read(self, _limit):
+                return b'{"access_token":"short","user_id":123}'
+
+        def fake_urlopen(req, timeout=20):
+            seen["content_type"] = req.headers.get("Content-type")
+            seen["body"] = req.data.decode("utf-8")
+            return FakeResponse()
+
+        oauth_app.urlopen = fake_urlopen
+        try:
+            result = oauth_app._http_json("https://api.instagram.com/oauth/access_token", method="POST", form={
+                "client_id": "app-id", "client_secret": "secret", "code": "a+b/c",
+            })
+        finally:
+            oauth_app.urlopen = original
+        self.assertEqual(seen["content_type"], "application/x-www-form-urlencoded")
+        self.assertIn("code=a%2Bb%2Fc", seen["body"])
+        self.assertEqual(result["user_id"], 123)
 
     def test_connect_fails_closed_without_meta_credentials(self):
-        os.environ.pop("META_APP_SECRET", None)
+        os.environ.pop("INSTAGRAM_APP_SECRET", None)
         response = self.client.get("/connect/instagram")
         self.assertEqual(response.status_code, 503)
         self.assertIn(b"not configured", response.data)
-
-    def test_code_exchange_uses_meta_app_credentials_server_side(self):
-        seen = {}
-        original = oauth_app._http_json
-
-        def fake_http(url, **_kwargs):
-            seen["url"] = url
-            return {"access_token": "test-access-token", "expires_in": 3600}
-
-        oauth_app._http_json = fake_http
-        try:
-            result = oauth_app.exchange_authorization_code("abc+123")
-        finally:
-            oauth_app._http_json = original
-        parsed = urlparse(seen["url"])
-        params = parse_qs(parsed.query)
-        self.assertEqual(parsed.netloc, "graph.facebook.com")
-        self.assertEqual(params["client_id"], ["test-meta-app-id"])
-        self.assertEqual(params["client_secret"], ["test-meta-app-secret"])
-        self.assertEqual(params["code"], ["abc+123"])
-        self.assertTrue(result["access_token"])
 
     def test_callback_rejects_missing_or_mismatched_state(self):
         response = self.client.get("/oauth/callback?code=sample&state=wrong")
@@ -89,19 +93,17 @@ class OAuthAppTests(unittest.TestCase):
             sess["oauth_started_at"] = int(oauth_app.time.time())
         oauth_app.exchange_authorization_code = lambda code: {
             "access_token": "LONG_LIVED_SECRET_TOKEN",
-            "expires_at": "",
-        }
-        oauth_app.fetch_assigned_instagram_account = lambda token: {
-            "ig_user_id": "123456",
+            "user_id": "123456",
             "username": "sample.creator",
-            "client_business_id": "biz-001",
+            "expires_at": oauth_app.iso(oauth_app.now_utc() + timedelta(days=55)),
+            "scopes": ["instagram_business_basic"],
         }
-        oauth_app.fetch_profile = lambda token, ig_user_id: {
-            "id": ig_user_id, "username": "sample.creator",
+        oauth_app.fetch_profile = lambda token: {
+            "user_id": "123456", "username": "sample.creator",
             "account_type": "CREATOR", "media_count": 10,
             "followers_count": 250, "follows_count": 180,
         }
-        oauth_app.fetch_media = lambda token, ig_user_id: [{
+        oauth_app.fetch_media = lambda token: [{
             "id": "m1", "caption": "Hello", "media_type": "IMAGE",
             "permalink": "https://www.instagram.com/p/example/",
             "timestamp": oauth_app.iso(oauth_app.now_utc()),
@@ -115,7 +117,6 @@ class OAuthAppTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertNotIn("LONG_LIVED_SECRET_TOKEN", row["token_ciphertext"])
         self.assertEqual(row["username"], "sample.creator")
-        self.assertEqual(row["client_business_id"], "biz-001")
         dashboard = self.client.get("/api/dashboard").get_json()
         self.assertTrue(dashboard["connected"])
 
@@ -123,7 +124,7 @@ class OAuthAppTests(unittest.TestCase):
         with self.client.session_transaction() as sess:
             sess["cid"] = "browser-session-2"
         oauth_app._store_account(
-            "browser-session-2", "9", "account", "biz-9", "cfg-9", "hidden-token",
+            "browser-session-2", "9", "account", "hidden-token",
             oauth_app.iso(oauth_app.now_utc() + timedelta(days=55)), [],
             {"username": "account", "followers_count": 12}, [],
         )
@@ -140,20 +141,19 @@ class OAuthAppTests(unittest.TestCase):
             sess["cid"] = "browser-session-3"
             sess["_csrf"] = "csrf-value"
         oauth_app._store_account(
-            "browser-session-3", "10", "account", "biz-10", "cfg-10", "secret-token",
-            "", [], {}, [],
+            "browser-session-3", "10", "account", "secret-token",
+            oauth_app.iso(oauth_app.now_utc() + timedelta(days=55)), [], {}, [],
         )
         response = self.client.post("/api/disconnect", headers={"X-CSRF-Token": "csrf-value"})
         self.assertEqual(response.status_code, 200)
         self.assertFalse(self.client.get("/api/dashboard").get_json()["connected"])
 
-    def test_health_check_reports_unified_oauth_architecture(self):
+    def test_health_check_reports_oauth_architecture(self):
         data = self.client.get("/healthz").get_json()
         self.assertTrue(data["ok"])
-        self.assertFalse(data["password_collection"])
-        self.assertFalse(data["data_import_enabled"])
-        self.assertFalse(data["unfollow_api"])
-        self.assertEqual(data["oauth_provider"], "Meta Instagram API with Unified Login")
+        self.assertTrue(data["password_collection"] is False)
+        self.assertTrue(data["data_import_enabled"] is False)
+        self.assertTrue(data["unfollow_api"] is False)
 
     def test_analytics_only_describes_loaded_media(self):
         analytics = oauth_app.build_analytics(
