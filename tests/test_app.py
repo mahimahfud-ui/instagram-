@@ -133,6 +133,13 @@ def test_page_and_health_endpoint(client):
     assert health.json["ok"] is True
 
 
+def test_favicon_is_served(client):
+    response = client.get("/favicon.ico")
+    assert response.status_code == 200
+    assert response.mimetype == "image/svg+xml"
+    assert "<svg" in response.get_data(as_text=True)
+
+
 def test_database_reinitialization_preserves_import_history(client):
     upload(client, make_archive(["alice"], ["alice", "bob"]))
     upload(client, make_archive(["alice", "bob"], ["alice", "bob"]))
