@@ -1,0 +1,133 @@
+import io
+import json
+import zipfile
+
+import pytest
+
+import app_updated as module
+
+
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "DB_PATH", tmp_path / "test.sqlite3")
+    module.init_db()
+    module.app.config.update(TESTING=True)
+    with module.app.test_client() as test_client:
+        with test_client.session_transaction() as state:
+            state["cid"] = "test-browser"
+            state["_csrf"] = "test-csrf-token"
+        yield test_client
+
+
+def make_archive(followers, following):
+    payload = io.BytesIO()
+    follower_records = [
+        {
+            "title": name,
+            "string_list_data": [
+                {"value": name, "href": f"https://www.instagram.com/{name}/"}
+            ],
+        }
+        for name in followers
+    ]
+    following_records = {
+        "relationships_following": [
+            {
+                "title": name,
+                "string_list_data": [
+                    {"value": name, "href": f"https://www.instagram.com/{name}/"}
+                ],
+            }
+            for name in following
+        ]
+    }
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "connections/followers_and_following/followers_1.json",
+            json.dumps(follower_records),
+        )
+        archive.writestr(
+            "connections/followers_and_following/following.json",
+            json.dumps(following_records),
+        )
+    return payload.getvalue()
+
+
+def upload(client, archive_bytes):
+    return client.post(
+        "/api/import",
+        data={
+            "file": (io.BytesIO(archive_bytes), "instagram-export.zip"),
+            "profile_username": "my.test_account",
+        },
+        headers={"X-CSRF-Token": "test-csrf-token"},
+        content_type="multipart/form-data",
+    )
+
+
+def test_import_and_relationship_lists(client):
+    response = upload(client, make_archive(["alice", "bob"], ["alice", "charlie"]))
+    assert response.status_code == 200
+    assert response.json["result"]["followers"] == 2
+    assert response.json["result"]["following"] == 2
+
+    state = client.get("/api/state").json
+    assert state["ready"] is True
+    assert state["not_following_back"] == 1
+    assert state["fans"] == 1
+    assert state["mutual"] == 1
+    assert state["profile_username"] == "my.test_account"
+
+    not_back = client.get("/api/list?kind=notback").json
+    assert [row["username"] for row in not_back["rows"]] == ["charlie"]
+    fans = client.get("/api/list?kind=fans").json
+    assert [row["username"] for row in fans["rows"]] == ["bob"]
+
+
+def test_second_import_records_only_actual_list_differences(client):
+    upload(client, make_archive(["alice", "bob"], ["alice", "charlie"]))
+    response = upload(client, make_archive(["alice", "charlie"], ["alice", "bob", "dan"]))
+    assert response.status_code == 200
+    assert response.json["result"]["changes"] == 4
+    events = client.get("/api/activity").json["rows"]
+    kinds = {(item["kind"], item["username"]) for item in events}
+    assert ("added_to_followers", "charlie") in kinds
+    assert ("removed_from_followers", "bob") in kinds
+    assert ("added_to_following", "dan") in kinds
+    assert ("removed_from_following", "charlie") in kinds
+
+
+def test_rejects_non_zip_and_missing_relationship_file(client):
+    bad = client.post(
+        "/api/import",
+        data={"file": (io.BytesIO(b"not a zip"), "bad.zip")},
+        headers={"X-CSRF-Token": "test-csrf-token"},
+        content_type="multipart/form-data",
+    )
+    assert bad.status_code == 400
+
+    content = io.BytesIO()
+    with zipfile.ZipFile(content, "w") as archive:
+        archive.writestr("followers_and_following/followers_1.json", "[]")
+    missing = upload(client, content.getvalue())
+    assert missing.status_code == 400
+    assert "both followers and following" in missing.json["error"]
+
+
+def test_csrf_and_removed_credential_endpoints(client):
+    blocked = client.post("/api/clear")
+    assert blocked.status_code == 403
+    assert client.get("/admin").status_code == 404
+    assert client.post("/credential").status_code == 404
+    assert client.get("/cookies").status_code == 404
+
+
+def test_export_and_delete(client):
+    upload(client, make_archive(["alice"], ["alice", "bob"]))
+    exported = client.get("/api/export?kind=notback&format=csv")
+    assert exported.status_code == 200
+    assert "bob,notback" in exported.get_data(as_text=True)
+
+    deleted = client.post("/api/clear", headers={"X-CSRF-Token": "test-csrf-token"})
+    assert deleted.status_code == 200
+    assert client.get("/api/state").json["ready"] is False
