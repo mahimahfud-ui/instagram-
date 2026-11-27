@@ -1,3 +1,4 @@
 Flask>=3.1,<4.0
 gunicorn>=23,<24
-instagrapi>=2.2
+instagrapi>=2.2,<3.0
+pytest>=8,<9
