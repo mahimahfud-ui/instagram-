@@ -243,8 +243,8 @@ def _http_json(
     headers = {"Accept": "application/json", "User-Agent": "InsightStudio/3.0"}
     body = None
     if form is not None:
-        body, content_type = _multipart(form)
-        headers["Content-Type"] = content_type
+        body = urlencode(form).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
     req = Request(url, data=body, headers=headers, method=method)
     try:
         with urlopen(req, timeout=timeout) as response:
@@ -435,7 +435,8 @@ def _store_account(
                 profile_json=excluded.profile_json,
                 media_json=excluded.media_json,
                 analytics_json=excluded.analytics_json,
-                synced_at=excluded.synced_at
+                synced_at=excluded.synced_at,
+                connected_at=excluded.connected_at
             """,
             (
                 cid, user_id, username, encrypted, expires_at,

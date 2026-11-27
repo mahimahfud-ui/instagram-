@@ -47,6 +47,34 @@ class OAuthAppTests(unittest.TestCase):
         self.assertTrue(params.get("state", [""])[0])
         self.assertIn("instagram_business_basic", params["scope"][0])
 
+    def test_oauth_token_exchange_uses_urlencoded_form(self):
+        seen = {}
+        original = oauth_app.urlopen
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+            def read(self, _limit):
+                return b'{"access_token":"short","user_id":123}'
+
+        def fake_urlopen(req, timeout=20):
+            seen["content_type"] = req.headers.get("Content-type")
+            seen["body"] = req.data.decode("utf-8")
+            return FakeResponse()
+
+        oauth_app.urlopen = fake_urlopen
+        try:
+            result = oauth_app._http_json("https://api.instagram.com/oauth/access_token", method="POST", form={
+                "client_id": "app-id", "client_secret": "secret", "code": "a+b/c",
+            })
+        finally:
+            oauth_app.urlopen = original
+        self.assertEqual(seen["content_type"], "application/x-www-form-urlencoded")
+        self.assertIn("code=a%2Bb%2Fc", seen["body"])
+        self.assertEqual(result["user_id"], 123)
+
     def test_connect_fails_closed_without_meta_credentials(self):
         os.environ.pop("INSTAGRAM_APP_SECRET", None)
         response = self.client.get("/connect/instagram")
