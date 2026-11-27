@@ -34,13 +34,8 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "data")).expanduser()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "insight.sqlite3"
 
-DEFAULT_SCOPES = (
-    "instagram_business_basic",
-    "instagram_business_manage_insights",
-)
-OAUTH_AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
-OAUTH_TOKEN_URL = "https://api.instagram.com/oauth/access_token"
-GRAPH_BASE_URL = "https://graph.instagram.com"
+OAUTH_AUTHORIZE_URL = "https://www.facebook.com/dialog/oauth"
+GRAPH_BASE_URL = "https://graph.facebook.com"
 
 
 class InstagramOAuthError(RuntimeError):
@@ -84,21 +79,20 @@ app.config.update(
 )
 
 
-def _instagram_app_id() -> str:
-    return (os.environ.get("INSTAGRAM_APP_ID") or "").strip()
+def _meta_app_id() -> str:
+    return (os.environ.get("META_APP_ID") or "").strip()
 
 
-def _instagram_app_secret() -> str:
-    return (os.environ.get("INSTAGRAM_APP_SECRET") or "").strip()
+def _meta_app_secret() -> str:
+    return (os.environ.get("META_APP_SECRET") or "").strip()
 
 
-def _scopes() -> list[str]:
-    raw = os.environ.get("INSTAGRAM_SCOPES", ",".join(DEFAULT_SCOPES))
-    return [item.strip() for item in raw.split(",") if item.strip()]
+def _login_config_id() -> str:
+    return (os.environ.get("META_LOGIN_CONFIG_ID") or "").strip()
 
 
 def _redirect_uri() -> str:
-    configured = (os.environ.get("INSTAGRAM_REDIRECT_URI") or "").strip()
+    configured = (os.environ.get("META_REDIRECT_URI") or "").strip()
     if configured:
         return configured
     return url_for("instagram_callback", _external=True)
@@ -150,8 +144,10 @@ def init_db() -> None:
                 cid TEXT PRIMARY KEY,
                 ig_user_id TEXT NOT NULL,
                 username TEXT NOT NULL DEFAULT '',
+                client_business_id TEXT NOT NULL DEFAULT '',
+                config_id TEXT NOT NULL DEFAULT '',
                 token_ciphertext TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL DEFAULT '',
                 granted_scopes TEXT NOT NULL DEFAULT '[]',
                 profile_json TEXT NOT NULL DEFAULT '{}',
                 media_json TEXT NOT NULL DEFAULT '[]',
@@ -161,6 +157,13 @@ def init_db() -> None:
             )
             """
         )
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(oauth_accounts)")}
+        for name, declaration in (
+            ("client_business_id", "TEXT NOT NULL DEFAULT ''"),
+            ("config_id", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in columns:
+                db.execute("ALTER TABLE oauth_accounts ADD COLUMN " + name + " " + declaration)
         db.commit()
 
 
@@ -273,45 +276,22 @@ def _http_json(
 
 
 def exchange_authorization_code(code: str) -> dict[str, Any]:
-    app_id, app_secret = _instagram_app_id(), _instagram_app_secret()
+    app_id, app_secret = _meta_app_id(), _meta_app_secret()
     if not app_id or not app_secret:
-        raise InstagramOAuthError("Instagram Login is not configured on this server yet.")
-    short_token = _http_json(
-        OAUTH_TOKEN_URL,
-        method="POST",
-        form={
+        raise InstagramOAuthError("Meta App ID and App Secret are not configured on this server.")
+    response = _http_json(
+        GRAPH_BASE_URL + "/" + GRAPH_VERSION + "/oauth/access_token?" + urlencode({
             "client_id": app_id,
             "client_secret": app_secret,
-            "grant_type": "authorization_code",
-            "redirect_uri": _redirect_uri(),
             "code": code,
-        },
-    )
-    token = short_token.get("access_token")
-    user_id = short_token.get("user_id") or short_token.get("id")
-    if not token or not user_id:
-        raise InstagramOAuthError("Instagram did not return the expected account authorization.")
-    long_token = _http_json(
-        GRAPH_BASE_URL + "/access_token?" + urlencode({
-            "grant_type": "ig_exchange_token",
-            "client_secret": app_secret,
-            "access_token": token,
         })
     )
-    access_token = long_token.get("access_token")
-    expires_in = int(long_token.get("expires_in") or 0)
-    if not access_token or expires_in <= 0:
-        raise InstagramOAuthError("Instagram did not issue a long-lived access token.")
-    granted = short_token.get("permissions") or _scopes()
-    if isinstance(granted, str):
-        granted = [part.strip() for part in granted.split(",") if part.strip()]
-    return {
-        "access_token": access_token,
-        "user_id": str(user_id),
-        "expires_at": iso(now_utc() + timedelta(seconds=expires_in)),
-        "scopes": granted if isinstance(granted, list) else _scopes(),
-        "username": str(short_token.get("username") or ""),
-    }
+    token = response.get("access_token")
+    if not token:
+        raise InstagramOAuthError("Meta did not return an access token.")
+    expires_in = int(response.get("expires_in") or 0)
+    expiry = iso(now_utc() + timedelta(seconds=expires_in)) if expires_in > 0 else ""
+    return {"access_token": token, "expires_at": expiry}
 
 
 def instagram_get(path: str, access_token: str, params: dict[str, str] | None = None) -> dict[str, Any]:
@@ -322,27 +302,50 @@ def instagram_get(path: str, access_token: str, params: dict[str, str] | None = 
     return _http_json(url)
 
 
-def fetch_profile(access_token: str) -> dict[str, Any]:
+def fetch_assigned_instagram_account(access_token: str) -> dict[str, str]:
+    business = instagram_get("me", access_token, {"fields": "client_business_id"})
+    client_business_id = str(business.get("client_business_id") or "")
+    accounts = instagram_get(
+        "me/assigned_instagram_accounts",
+        access_token,
+        {"fields": "id,username"},
+    )
+    rows = accounts.get("data") or []
+    if not isinstance(rows, list) or not rows:
+        raise InstagramOAuthError(
+            "No Instagram professional account was shared with this app. In the Meta login dialog, select your Business Portfolio and Instagram account."
+        )
+    first = rows[0]
+    if not isinstance(first, dict) or not first.get("id"):
+        raise InstagramOAuthError("Meta did not return a usable Instagram account ID.")
+    return {
+        "ig_user_id": str(first["id"]),
+        "username": str(first.get("username") or ""),
+        "client_business_id": client_business_id,
+    }
+
+
+def fetch_profile(access_token: str, ig_user_id: str) -> dict[str, Any]:
     field_sets = (
-        "user_id,username,account_type,media_count,followers_count,follows_count",
-        "user_id,username,account_type,media_count",
-        "user_id,username",
+        "id,username,account_type,media_count,followers_count,follows_count,profile_picture_url,biography,website",
+        "id,username,account_type,media_count,followers_count,follows_count",
+        "id,username,media_count",
     )
     last_error: Exception | None = None
     for fields in field_sets:
         try:
-            profile = instagram_get("me", access_token, {"fields": fields})
-            if profile.get("username") or profile.get("user_id") or profile.get("id"):
+            profile = instagram_get(ig_user_id, access_token, {"fields": fields})
+            if profile.get("username") or profile.get("id"):
                 return profile
         except InstagramOAuthError as exc:
             last_error = exc
     raise InstagramOAuthError(str(last_error or "Could not read your Instagram profile."))
 
 
-def fetch_media(access_token: str) -> list[dict[str, Any]]:
+def fetch_media(access_token: str, ig_user_id: str) -> list[dict[str, Any]]:
     try:
         response = instagram_get(
-            "me/media",
+            ig_user_id + "/media",
             access_token,
             {
                 "fields": "id,caption,media_type,permalink,timestamp,like_count,comments_count",
@@ -351,7 +354,7 @@ def fetch_media(access_token: str) -> list[dict[str, Any]]:
         )
     except InstagramOAuthError:
         response = instagram_get(
-            "me/media",
+            ig_user_id + "/media",
             access_token,
             {"fields": "id,caption,media_type,permalink,timestamp", "limit": "25"},
         )
@@ -372,7 +375,6 @@ def fetch_media(access_token: str) -> list[dict[str, Any]]:
             "comments_count": item.get("comments_count") if isinstance(item.get("comments_count"), int) else None,
         })
     return clean
-
 
 def build_analytics(profile: dict[str, Any], media: list[dict[str, Any]]) -> dict[str, Any]:
     likes = [item["like_count"] for item in media if isinstance(item.get("like_count"), int)]
@@ -408,9 +410,11 @@ def _store_account(
     cid: str,
     user_id: str,
     username: str,
+    client_business_id: str,
+    config_id: str,
     access_token: str,
     expires_at: str,
-    scopes: list[str],
+    scopes: list[str] | None = None,
     profile: dict[str, Any] | None = None,
     media: list[dict[str, Any]] | None = None,
 ) -> None:
@@ -423,12 +427,14 @@ def _store_account(
         db.execute(
             """
             INSERT INTO oauth_accounts
-                (cid, ig_user_id, username, token_ciphertext, expires_at, granted_scopes,
-                 profile_json, media_json, analytics_json, connected_at, synced_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (cid, ig_user_id, username, client_business_id, config_id, token_ciphertext,
+                 expires_at, granted_scopes, profile_json, media_json, analytics_json, connected_at, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(cid) DO UPDATE SET
                 ig_user_id=excluded.ig_user_id,
                 username=excluded.username,
+                client_business_id=excluded.client_business_id,
+                config_id=excluded.config_id,
                 token_ciphertext=excluded.token_ciphertext,
                 expires_at=excluded.expires_at,
                 granted_scopes=excluded.granted_scopes,
@@ -439,8 +445,8 @@ def _store_account(
                 connected_at=excluded.connected_at
             """,
             (
-                cid, user_id, username, encrypted, expires_at,
-                json.dumps(scopes), json.dumps(profile_data), json.dumps(media_data),
+                cid, user_id, username, client_business_id, config_id, encrypted, expires_at,
+                json.dumps(scopes or []), json.dumps(profile_data), json.dumps(media_data),
                 json.dumps(analytics), timestamp, timestamp,
             ),
         )
@@ -459,51 +465,24 @@ def _decrypt_token(row) -> str:
         raise ReauthorizationRequired("The saved authorization cannot be decrypted. Reconnect Instagram.") from exc
 
 
-def refresh_token_if_needed(row) -> tuple[str, str]:
-    token = _decrypt_token(row)
-    expires_at = parse_iso(row["expires_at"])
-    connected_at = parse_iso(row["connected_at"])
-    if not expires_at:
-        return token, row["expires_at"]
-    seconds_left = (expires_at - now_utc()).total_seconds()
-    token_age = (now_utc() - connected_at).total_seconds() if connected_at else 0
-    if seconds_left > 10 * 24 * 60 * 60 or token_age < 24 * 60 * 60:
-        return token, row["expires_at"]
-    refreshed = _http_json(
-        GRAPH_BASE_URL + "/refresh_access_token?" + urlencode({
-            "grant_type": "ig_refresh_token",
-            "access_token": token,
-        })
-    )
-    new_token = refreshed.get("access_token")
-    expires_in = int(refreshed.get("expires_in") or 0)
-    if not new_token or expires_in <= 0:
-        raise ReauthorizationRequired("Instagram could not refresh this connection. Please reconnect.")
-    new_expiry = iso(now_utc() + timedelta(seconds=expires_in))
-    with connect() as db:
-        db.execute(
-            "UPDATE oauth_accounts SET token_ciphertext=?, expires_at=? WHERE cid=?",
-            (_fernet().encrypt(new_token.encode("utf-8")).decode("ascii"), new_expiry, row["cid"]),
-        )
-        db.commit()
-    return new_token, new_expiry
-
-
 def sync_instagram_data(cid: str) -> dict[str, Any]:
     row = _row_for(cid)
     if not row:
         raise InstagramOAuthError("Connect your Instagram account first.")
-    token, _expires_at = refresh_token_if_needed(row)
-    profile = fetch_profile(token)
-    media = fetch_media(token)
-    user_id = str(profile.get("user_id") or profile.get("id") or row["ig_user_id"])
+    token = _decrypt_token(row)
+    expires_at = parse_iso(row["expires_at"])
+    if expires_at and expires_at <= now_utc():
+        raise ReauthorizationRequired("This Meta authorization has expired. Please reconnect Instagram.")
+    ig_user_id = str(row["ig_user_id"])
+    profile = fetch_profile(token, ig_user_id)
+    media = fetch_media(token, ig_user_id)
     username = str(profile.get("username") or row["username"])
     _store_account(
-        cid, user_id, username, token, _expires_at,
-        json.loads(row["granted_scopes"] or "[]"), profile, media,
+        cid, ig_user_id, username, row["client_business_id"], row["config_id"],
+        token, row["expires_at"], json.loads(row["granted_scopes"] or "[]"),
+        profile, media,
     )
     return {"profile": profile, "media": media, "analytics": build_analytics(profile, media)}
-
 
 def dashboard_payload(cid: str) -> dict[str, Any]:
     row = _row_for(cid)
@@ -520,6 +499,8 @@ def dashboard_payload(cid: str) -> dict[str, Any]:
         "connected": True,
         "username": row["username"],
         "ig_user_id": row["ig_user_id"],
+        "client_business_id": row["client_business_id"],
+        "config_id": row["config_id"],
         "profile": profile,
         "media": media,
         "analytics": analytics,
@@ -532,7 +513,7 @@ def dashboard_payload(cid: str) -> dict[str, Any]:
 
 @app.get("/")
 def home():
-    config_ready = bool(_instagram_app_id() and _instagram_app_secret())
+    config_ready = bool(_meta_app_id() and _meta_app_secret() and _login_config_id())
     return render_template_string(
         PAGE,
         csrf=csrf_token(),
@@ -543,9 +524,9 @@ def home():
 
 @app.get("/connect/instagram")
 def connect_instagram():
-    app_id, app_secret = _instagram_app_id(), _instagram_app_secret()
-    if not app_id or not app_secret:
-        return render_template_string(ERROR_PAGE, title="Instagram Login is not configured", message="The server owner must add INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET in the hosting environment before users can connect Instagram."), 503
+    app_id, app_secret, config_id = _meta_app_id(), _meta_app_secret(), _login_config_id()
+    if not app_id or not app_secret or not config_id:
+        return render_template_string(ERROR_PAGE, title="Meta Unified Login is not configured", message="The server owner must add META_APP_ID, META_APP_SECRET and META_LOGIN_CONFIG_ID in the hosting environment before users can connect Instagram."), 503
     redirect_uri = _redirect_uri()
     parsed = urlparse(redirect_uri)
     if parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1"):
@@ -555,9 +536,11 @@ def connect_instagram():
     session["oauth_started_at"] = int(time.time())
     query = urlencode({
         "client_id": app_id,
+        "config_id": config_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": ",".join(_scopes()),
+        "display": "popup",
+        "prompt": "login",
         "state": state,
     })
     return redirect(OAUTH_AUTHORIZE_URL + "?" + query, code=302)
@@ -580,13 +563,14 @@ def instagram_callback():
         return render_template_string(ERROR_PAGE, title="Authorization code missing", message="Instagram did not return an authorization code. Please try again."), 400
     try:
         token_data = exchange_authorization_code(code)
-        profile = fetch_profile(token_data["access_token"])
-        media = fetch_media(token_data["access_token"])
-        username = str(profile.get("username") or token_data.get("username") or "")
-        user_id = str(profile.get("user_id") or profile.get("id") or token_data["user_id"])
+        account = fetch_assigned_instagram_account(token_data["access_token"])
+        profile = fetch_profile(token_data["access_token"], account["ig_user_id"])
+        media = fetch_media(token_data["access_token"], account["ig_user_id"])
+        username = str(profile.get("username") or account.get("username") or "")
         _store_account(
-            session["cid"], user_id, username, token_data["access_token"],
-            token_data["expires_at"], token_data["scopes"], profile, media,
+            session["cid"], account["ig_user_id"], username,
+            account["client_business_id"], _login_config_id(),
+            token_data["access_token"], token_data["expires_at"], [], profile, media,
         )
     except InstagramOAuthError as exc:
         return render_template_string(ERROR_PAGE, title="Instagram connection failed", message=str(exc)), 502
@@ -630,13 +614,13 @@ def healthz():
         db_ok = True
     except sqlite3.Error:
         db_ok = False
-    configured = bool(_instagram_app_id() and _instagram_app_secret())
+    configured = bool(_meta_app_id() and _meta_app_secret() and _login_config_id())
     return jsonify(
         ok=db_ok,
         app_version=APP_VERSION,
         database="available" if db_ok else "unavailable",
         instagram_login_configured=configured,
-        oauth_provider="Instagram Login",
+        oauth_provider="Meta Instagram API with Unified Login",
         password_collection=False,
         token_storage="encrypted_at_rest",
         data_import_enabled=False,
