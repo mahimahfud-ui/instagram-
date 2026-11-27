@@ -123,6 +123,24 @@ def test_csrf_and_removed_credential_endpoints(client):
     assert client.get("/cookies").status_code == 404
 
 
+def test_page_and_health_endpoint(client):
+    page = client.get("/")
+    assert page.status_code == 200
+    assert 'name="csrf-token"' in page.get_data(as_text=True)
+    assert "__CSRF__" not in page.get_data(as_text=True)
+    health = client.get("/healthz")
+    assert health.status_code == 200
+    assert health.json["ok"] is True
+
+
+def test_database_reinitialization_preserves_import_history(client):
+    upload(client, make_archive(["alice"], ["alice", "bob"]))
+    upload(client, make_archive(["alice", "bob"], ["alice", "bob"]))
+    module.init_db()
+    assert client.get("/api/state").json["ready"] is True
+    assert len(client.get("/api/activity").json["rows"]) == 1
+
+
 def test_export_and_delete(client):
     upload(client, make_archive(["alice"], ["alice", "bob"]))
     exported = client.get("/api/export?kind=notback&format=csv")
