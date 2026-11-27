@@ -57,6 +57,8 @@ class OAuthAppTests(unittest.TestCase):
         self.assertIn(b"not configured", response.data)
 
     def test_code_exchange_uses_meta_app_credentials_server_side(self):
+        os.environ["META_APP_ID"] = "test-meta-app-id"
+        os.environ["META_APP_SECRET"] = "test-meta-app-secret"
         seen = {}
         original = oauth_app._http_json
 
