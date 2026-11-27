@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+secret.key
+events.jsonl
+insight.log*
+.venv/
+venv/
+.env
