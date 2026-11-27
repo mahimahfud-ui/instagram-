@@ -841,21 +841,9 @@ body::before{
 
 .language{font-size:13px;color:var(--mut);margin-bottom:20px;animation:up .55s .06s var(--e) backwards}
 
-.logo{position:relative;width:78px;height:78px;margin:0 auto 24px;display:grid;place-items:center;animation:up .7s .12s var(--e) backwards}
-.logo::before{
-  content:"";position:absolute;inset:-14px;border-radius:50%;
-  background:conic-gradient(from 0deg,#feda75,#fa7e1e,#d62976,#962fbf,#4f5bd5,#feda75);
-  filter:blur(14px);opacity:.6;
-  animation:spin 7s linear infinite;
-}
-.logo::after{
-  content:"";position:absolute;inset:-5px;border-radius:26px;
-  background:conic-gradient(from 0deg,#feda75,#d62976,#4f5bd5,#feda75);
-  opacity:.55;filter:blur(2px);
-  animation:spin 5s linear infinite reverse;
-}
-.logo img{position:relative;width:70px;height:70px;z-index:2;animation:float 5.5s ease-in-out infinite;
-  filter:drop-shadow(0 8px 18px rgba(214,41,118,.35))}
+.logo{width:78px;height:78px;margin:0 auto 24px;display:grid;place-items:center;animation:up .7s .12s var(--e) backwards}
+.logo img{width:70px;height:70px;animation:float 5.5s ease-in-out infinite;
+  filter:drop-shadow(0 6px 16px rgba(214,41,118,.28))}
 
 .inputs{display:flex;flex-direction:column;gap:10px}
 
