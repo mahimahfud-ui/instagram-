@@ -1,5 +1,4 @@
-# Compatibility entry point for deployments configured as app:app.
-# The actual app is a safe, informational demo and does not collect credentials.
+"""Gunicorn entry point for the privacy-first Instagram export analyzer."""
 from app_updated import app
 
 __all__ = ["app"]
