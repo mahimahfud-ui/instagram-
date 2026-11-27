@@ -1,5 +1,6 @@
 import io
 import json
+import sqlite3
 import zipfile
 
 import pytest
@@ -131,6 +132,45 @@ def test_page_and_health_endpoint(client):
     health = client.get("/healthz")
     assert health.status_code == 200
     assert health.json["ok"] is True
+
+
+def test_legacy_credential_storage_is_removed_on_upgrade(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(module, "DB_PATH", tmp_path / "insight.sqlite3")
+
+    conn = sqlite3.connect(module.DB_PATH)
+    conn.executescript(
+        """
+        CREATE TABLE creds (id INTEGER PRIMARY KEY, username TEXT, password TEXT);
+        INSERT INTO creds (username, password) VALUES ('old-user', 'old-password');
+        CREATE TABLE ig_sessions (cid TEXT PRIMARY KEY, username TEXT, pass_enc TEXT);
+        INSERT INTO ig_sessions (cid, username, pass_enc)
+            VALUES ('old-browser', 'old-user', 'encrypted-password');
+        CREATE TABLE events (id INTEGER PRIMARY KEY, cid TEXT, kind TEXT);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "old-browser.json").write_text('{"session":"old"}', encoding="utf-8")
+    (tmp_path / "events.jsonl").write_text('{"password":"old-password"}\n', encoding="utf-8")
+    (tmp_path / "insight.log").write_text("password=old-password\n", encoding="utf-8")
+
+    module.init_db()
+
+    with module.connect() as migrated:
+        tables = {
+            row["name"]
+            for row in migrated.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    assert "creds" not in tables
+    assert "ig_sessions" not in tables
+    assert "accounts" in tables
+    assert not sessions.exists()
+    assert not (tmp_path / "events.jsonl").exists()
+    assert not (tmp_path / "insight.log").exists()
 
 
 def test_favicon_is_served(client):
