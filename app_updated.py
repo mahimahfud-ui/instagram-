@@ -117,16 +117,23 @@ def connect() -> sqlite3.Connection:
 def _purge_legacy_credential_material() -> None:
     """Remove credential-capture tables and files created by the old app."""
     with connect() as conn:
-        for table in (
+        existing = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        legacy_tables = {
             "creds", "ig_sessions", "attempts", "verification_attempts",
             "followers_cache", "following_cache", "profiles", "snapshots",
             "engagement", "visits", "actions", "self",
-        ):
-            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
-        # The previous application used the same events table for scraped activity.
-        conn.execute("DROP TABLE IF EXISTS events")
-        conn.commit()
-        conn.execute("VACUUM")
+        }
+        legacy_present = bool(existing & legacy_tables)
+        if legacy_present:
+            for table in legacy_tables:
+                conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+            # The previous application used the same events table for scraped activity.
+            conn.execute("DROP TABLE IF EXISTS events")
+            conn.commit()
+            conn.execute("VACUUM")
     shutil.rmtree(DATA_DIR / "sessions", ignore_errors=True)
     for pattern in ("events.jsonl", "insight.log", "insight.log.*"):
         for old_file in DATA_DIR.glob(pattern):
