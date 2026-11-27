@@ -89,6 +89,10 @@ class OAuthAppTests(unittest.TestCase):
             sess["cid"] = "browser-session-1"
             sess["oauth_state"] = "valid-state"
             sess["oauth_started_at"] = int(oauth_app.time.time())
+        original_exchange = oauth_app.exchange_authorization_code
+        original_assigned = oauth_app.fetch_assigned_instagram_account
+        original_profile = oauth_app.fetch_profile
+        original_media = oauth_app.fetch_media
         oauth_app.exchange_authorization_code = lambda code: {
             "access_token": "LONG_LIVED_SECRET_TOKEN",
             "expires_at": "",
@@ -109,7 +113,13 @@ class OAuthAppTests(unittest.TestCase):
             "timestamp": oauth_app.iso(oauth_app.now_utc()),
             "like_count": 20, "comments_count": 4,
         }]
-        response = self.client.get("/oauth/callback?code=sample-code&state=valid-state")
+        try:
+            response = self.client.get("/oauth/callback?code=sample-code&state=valid-state")
+        finally:
+            oauth_app.exchange_authorization_code = original_exchange
+            oauth_app.fetch_assigned_instagram_account = original_assigned
+            oauth_app.fetch_profile = original_profile
+            oauth_app.fetch_media = original_media
         self.assertEqual(response.status_code, 302)
         self.assertIn("connected=1", response.headers["Location"])
         with oauth_app.connect() as db:
