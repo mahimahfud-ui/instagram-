@@ -88,12 +88,13 @@ def test_second_import_records_only_actual_list_differences(client):
     upload(client, make_archive(["alice", "bob"], ["alice", "charlie"]))
     response = upload(client, make_archive(["alice", "charlie"], ["alice", "bob", "dan"]))
     assert response.status_code == 200
-    assert response.json["result"]["changes"] == 4
+    assert response.json["result"]["changes"] == 5
     events = client.get("/api/activity").json["rows"]
     kinds = {(item["kind"], item["username"]) for item in events}
     assert ("added_to_followers", "charlie") in kinds
     assert ("removed_from_followers", "bob") in kinds
     assert ("added_to_following", "dan") in kinds
+    assert ("added_to_following", "bob") in kinds
     assert ("removed_from_following", "charlie") in kinds
 
 
