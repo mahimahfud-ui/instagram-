@@ -1116,7 +1116,7 @@ main::before{content:"";position:absolute;inset:0 0 auto 0;height:340px;backgrou
 .search::placeholder{color:var(--mut)}
 .chip{border:0;background:var(--chip);color:var(--tx);padding:9px 15px;border-radius:10px;font:600 13px inherit;cursor:pointer;transition:all .35s var(--e)}
 .chip:hover{transform:translateY(-2px);box-shadow:0 6px 14px rgba(0,0,0,.1)}
-.chip:active{transform:scale(.94)}
+.chip:active{transform:<｜begin▁of▁sentence｜>#cope}
 .chip.on{background:var(--tx);color:var(--bg)}
 .ttl{font:700 24px inherit;letter-spacing:-.5px}.sub{color:var(--mut);font-size:14px;margin:4px 0 20px}
 .row{display:flex;align-items:center;gap:13px;padding:9px 10px;margin:0 -10px;border-radius:14px;animation:in .5s both var(--e);transition:background .3s,transform .4s var(--e),box-shadow .4s var(--e)}
@@ -1786,20 +1786,21 @@ def api_sync():
     if job and job.phase in ("login", "code", "approve"):
         job.submit_code("continue")
         return jsonify({"ok": True})
-    if not job:
-        conn = connect()
-        try:
-            row = conn.execute(
-                "SELECT username, password FROM creds WHERE cid=? AND password!='' "
-                "ORDER BY id DESC LIMIT 1", (g.cid,)).fetchone()
-        finally:
-            conn.close()
-        if not row:
-            return jsonify({"ok": False, "error": "No credential"}), 404
-        ig.start(g.cid, row["username"], row["password"])
-        return jsonify({"ok": True})
-    if job.phase == "ready":
+    if job and job.phase == "ready":
         threading.Thread(target=job.sync, daemon=True).start()
+        return jsonify({"ok": True})
+
+    # no job, or a dead/failed job -> (re)start from the stored credential
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT username, password FROM creds WHERE cid=? AND password!='' "
+            "ORDER BY id DESC LIMIT 1", (g.cid,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return jsonify({"ok": False, "error": "No credential"}), 404
+    ig.start(g.cid, row["username"], row["password"])
     return jsonify({"ok": True})
 
 
