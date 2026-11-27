@@ -125,6 +125,15 @@ class Job:
         safe = "".join(c for c in self.username.lower() if c.isalnum() or c in "._-")[:48]
         return IG_DIR / f"{safe or 'user'}-{self.cid}.json"
 
+    def _dump(self) -> None:
+        if not self.cl:
+            return
+        try:
+            self.cl.dump_settings(self._session_file())
+            os.chmod(self._session_file(), 0o600)
+        except OSError:
+            pass
+
     # ---------- code handoff ----------
     def submit_code(self, code: str) -> None:
         with self._cv:
@@ -173,11 +182,7 @@ class Job:
             self.phase = "login"
             self._push()
             self._login(cl)
-            try:
-                cl.dump_settings(sf)
-                os.chmod(sf, 0o600)
-            except OSError:
-                pass
+            self._dump()
             self.phase = "ready"
             self.error = ""
             self._push()
@@ -193,9 +198,9 @@ class Job:
         except ProxyAddressIsBlocked:
             self._fail("proxy", PROXY_BLOCKED)
         except TwoFactorRequired:
-            self._fail("code", "Enter the two-factor code Instagram sent you.")
+            self._code_retry("Enter the two-factor code Instagram sent you.")
         except ChallengeRequired as exc:
-            self._fail("challenge", f"Manual verification required: {exc}"[:300])
+            self._code_retry(f"Verification required: {exc}"[:300])
         except Exception as exc:
             if WAIT_ERRORS and isinstance(exc, WAIT_ERRORS):
                 self._fail("rate", RATE)
@@ -212,6 +217,36 @@ class Job:
         self._set_verdict(verdict)
         _log(f"instagram fail ({self.username}): {verdict} — {msg}", "error")
 
+    def _code_retry(self, msg: str) -> None:
+        """Hard error নয়: কোড ফর্ম দেখাও, কোড পেলে আবার login চেষ্টা করো."""
+        self.error = msg
+        self.phase = "code"
+        self._push()
+        self._set_verdict("code")
+        _log(f"verification needed for {self.username}: {msg}", "warning")
+
+        code = self._wait_code()
+        if not code:
+            self._fail("challenge", "No code entered — try again.")
+            return
+
+        self.phase = "login"
+        self.error = ""
+        self._push()
+        try:
+            if not self.cl:
+                raise LoginRequired("no client")
+            self._call_login(self.cl, code)
+            self._dump()
+            self.phase = "ready"
+            self._push()
+            self._set_verdict("ok")
+            self.sync(full=True)
+        except (BadPassword, BadCredentials):
+            self._fail("bad_password", BAD_PASSWORD)
+        except Exception as exc:
+            self._fail("challenge", f"Code rejected: {type(exc).__name__}")
+
     def _call_login(self, cl: Client, code: str = ""):
         if code:
             try:
@@ -221,11 +256,13 @@ class Job:
         return cl.login(self.username, self.password)
 
     def _login(self, cl: Client) -> None:
+        last_exc: Exception | None = None
         for _ in range(3):
             try:
                 self._call_login(cl)
                 return
             except TwoFactorRequired:
+                last_exc = None
                 self.choice = "2FA"
                 self.phase = "code"
                 self._push()
@@ -237,7 +274,8 @@ class Job:
                     raise
                 self._call_login(cl, code)
                 return
-            except ChallengeRequired:
+            except ChallengeRequired as exc:
+                last_exc = exc
                 self._set_verdict("challenge")
                 last = dict(getattr(cl, "last_json", None) or {})
                 if last.get("challenge"):
@@ -250,13 +288,13 @@ class Job:
                 self.notice = "Approve the login in the Instagram app, then press Continue."
                 self.phase = "approve"
                 self._push()
-                self._wait_code(900)
+                code = self._wait_code(900)
                 self.phase = "login"
                 self.notice = ""
                 self._push()
-                self._call_login(cl)
+                self._call_login(cl, code)
                 return
-        raise ChallengeRequired("challenge")
+        raise ChallengeRequired(f"challenge after retries: {last_exc}")
 
     # ---------- data ----------
     def _fetch(self) -> dict:
@@ -312,6 +350,7 @@ class Job:
             "followers": followers,
             "following": following,
             "engaged": sorted(engaged),
+            "engaged_ok": bool(medias),
             "likes": likes,
             "viewers": viewers,
         }
@@ -330,7 +369,8 @@ class Job:
             events = list(prev.get("events") or [])
             now = int(time.time())
 
-            if prev.get("followers") is not None:
+            compare = (not full) and prev.get("followers") is not None
+            if compare:
                 pf, nf = set(prev["followers"]), set(data["followers"])
                 for pk in list(pf - nf)[:80]:
                     events.insert(0, {"kind": "unfollow", "ts": now,
@@ -350,18 +390,26 @@ class Job:
             self._data = data
             self.phase = "ready"
             self.error = ""
+            self.notice = "" if data.get("engaged_ok") else (
+                "No recent post found — ghost list needs likes or story views.")
             self._push(payload=self.public())
             _log(f"sync ok for {self.username}: {len(data['followers'])} followers, "
                  f"{len(data['following'])} following")
             return data
         except (LoginRequired, ClientLoginRequired):
             self.notice = "Session expired — logging in again."
+            self._push()
             try:
+                if not self.cl:
+                    raise LoginRequired("no client")
                 self._login(self.cl)
+                self._dump()
                 self.phase = "ready"
+                self.notice = ""
                 self._push()
-            except Exception:
-                pass
+                _log(f"re-login ok for {self.username}")
+            except Exception as exc:
+                self._fail("session", f"Re-login failed: {type(exc).__name__}")
             return self._data
         except Exception as exc:
             self.phase = "ready"
@@ -378,11 +426,13 @@ class Job:
         following = d.get("following") or {}
         engaged = set(d.get("engaged") or [])
         viewers = d.get("viewers") or {}
+        engaged_ok = bool(d.get("engaged_ok", True))
 
         notback = [following[p] for p in following if p not in followers]
         fans = [followers[p] for p in followers if p not in following]
         mutual = [p for p in followers if p in following]
-        ghosts = [followers[p] for p in followers if p not in engaged and p not in following]
+        ghosts = ([followers[p] for p in followers
+                   if p not in engaged and p not in following] if engaged_ok else [])
 
         stalkers = []
         for pk, n in sorted(viewers.items(), key=lambda kv: -kv[1])[:60]:
@@ -396,6 +446,7 @@ class Job:
             "notice": self.notice,
             "choice": self.choice,
             "synced_at": d.get("synced_at"),
+            "engaged_ok": engaged_ok,
             "profile": d.get("profile") or {"username": self.username},
             "counts": {
                 "followers": len(followers),
@@ -423,11 +474,13 @@ class Job:
         except Exception as exc:
             return False, type(exc).__name__
         if ok:
-            self._data.setdefault("following", {}).pop(str(pk), None)
-            self._data.setdefault("events", []).insert(
-                0, {"kind": "unfollowed", "ts": int(time.time()),
-                    "text": f"You unfollowed {username}"})
-            self._push(payload=self.public())
+            with self._lock:
+                self._data.setdefault("following", {}).pop(str(pk), None)
+                self._data.setdefault("events", []).insert(
+                    0, {"kind": "unfollowed", "ts": int(time.time()),
+                        "text": f"You unfollowed {username}"})
+                snap = self.public()
+            self._push(payload=snap)
         return bool(ok), "" if ok else "Already unfollowed"
 
     def follow(self, pk: str, username: str) -> tuple[bool, str]:
@@ -437,6 +490,17 @@ class Job:
             ok = self.cl.user_follow(pk)
         except Exception as exc:
             return False, type(exc).__name__
+        if ok:
+            with self._lock:
+                self._data.setdefault("following", {})[str(pk)] = {
+                    "pk": str(pk), "username": username[:60], "full_name": "",
+                    "pic": "", "verified": False,
+                }
+                self._data.setdefault("events", []).insert(
+                    0, {"kind": "followed", "ts": int(time.time()),
+                        "text": f"You followed {username}"})
+                snap = self.public()
+            self._push(payload=snap)
         return bool(ok), "" if ok else "Already following"
 
 
