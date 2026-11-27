@@ -9,3 +9,20 @@ services:
       name: data
       mountPath: /var/data
       sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
+      - key: DATA_DIR
+        value: /var/data
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: TRUST_PROXY
+        value: "1"
+      - key: LOGIN_WAIT
+        value: "20"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: IG_PROXY
+        sync: false
